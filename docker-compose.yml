@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: grok2api-pg
+    environment:
+      POSTGRES_USER: grok2api
+      POSTGRES_PASSWORD: grok2api
+      POSTGRES_DB: grok2api
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

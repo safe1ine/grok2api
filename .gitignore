@@ -1,0 +1,12 @@
+# 后端
+server/bin/
+server/.env
+
+# 前端
+web/node_modules/
+web/dist/
+*.tsbuildinfo
+
+# 通用
+*.log
+.DS_Store
