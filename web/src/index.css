@@ -1,3 +1,44 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  background: rgb(247, 248, 251);
+  font-family: 'Maple UI', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+body {
+  margin: 0;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+/* DaisyUI tooltip text lives in a generated pseudo-element, so bind floating UI explicitly. */
+.tooltip::before,
+.modal,
+.modal-box {
+  font-family: 'Maple UI', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.tooltip::before {
+  font-weight: 400;
+}
+
+.app-page-background {
+  background-color: rgb(247, 248, 251);
+  background-image: linear-gradient(#0f172a0b 1px, #0000 1px),
+    linear-gradient(90deg, #0f172a0b 1px, #0000 1px);
+  background-size: 24px 24px;
+}

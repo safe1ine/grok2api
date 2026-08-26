@@ -100,7 +100,15 @@ func parseRetryAfter(resp *http.Response) time.Duration {
 func (g *Gateway) Proxy(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	body, _ := io.ReadAll(r.Body)
+	roleChanged := false
+	if r.URL.Path == "/v1/messages" {
+		body, roleChanged = normalizeAnthropicMessageRoles(body)
+	}
+	body, namespaceMappings, namespaceChanged := flattenNamespaceTools(body)
+	body, schemaChanged := normalizeToolSchemas(body)
+	compatibilityChanged := roleChanged || namespaceChanged || schemaChanged
 	model := parseModel(body)
+	metrics := responseMetrics{Stream: parseStreamRequest(body)}
 	upstreamPath := r.URL.Path
 	if r.URL.RawQuery != "" {
 		upstreamPath += "?" + r.URL.RawQuery
@@ -109,6 +117,8 @@ func (g *Gateway) Proxy(w http.ResponseWriter, r *http.Request) {
 	var acct *pool.Account
 	finalStatus := 0
 	saw401 := map[int64]int{}
+	appliedStateFallbacks := map[stateCompatibilityIssue]bool{}
+	appliedUnsupportedArguments := map[string]bool{}
 
 	for attempt := 0; attempt < 6; attempt++ {
 		a, err := g.pool.Acquire()
@@ -141,7 +151,52 @@ func (g *Gateway) Proxy(w http.ResponseWriter, r *http.Request) {
 			g.pool.Release(a, time.Now())
 			break
 		}
-		g.captureRateLimit(a, resp)
+		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity {
+			errorBody, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			resp.Body = io.NopCloser(bytes.NewReader(errorBody))
+			if readErr == nil {
+				issue := classifyStateCompatibilityError(errorBody)
+				if issue != "" && !appliedStateFallbacks[issue] {
+					before := stateCompatibilitySummary(body)
+					if fallbackBody, changed := applyStateCompatibilityFallback(body, issue); changed {
+						if encoded, err := json.Marshal(before); err == nil {
+							log.Printf("上游状态兼容降级: path=%s issue=%s account=%d state=%s", upstreamPath, issue, a.ID, encoded)
+						}
+						body = fallbackBody
+						compatibilityChanged = true
+						appliedStateFallbacks[issue] = true
+						g.pool.Release(a, time.Now())
+						continue
+					}
+				}
+				argument := unsupportedArgument(errorBody)
+				if argument != "" && !appliedUnsupportedArguments[argument] {
+					if fallbackBody, changed := removeUnsupportedArgument(body, argument); changed {
+						log.Printf("上游参数兼容降级: path=%s argument=%s account=%d", upstreamPath, argument, a.ID)
+						body = fallbackBody
+						compatibilityChanged = true
+						appliedUnsupportedArguments[argument] = true
+						g.pool.Release(a, time.Now())
+						continue
+					}
+				}
+
+				lowerError := strings.ToLower(string(errorBody))
+				if strings.Contains(lowerError, "schema validation") {
+					if summary := toolSchemaSummary(body); summary != "" {
+						log.Printf("上游 Schema 失败: path=%s normalized=%t schema=%s", upstreamPath, compatibilityChanged, summary)
+					}
+				}
+				if strings.Contains(lowerError, "invalid message role") {
+					if summary := messageRoleSummary(body); summary != nil {
+						if encoded, err := json.Marshal(summary); err == nil {
+							log.Printf("上游 Message Roles 失败: path=%s normalized=%t roles=%s", upstreamPath, compatibilityChanged, encoded)
+						}
+					}
+				}
+			}
+		}
 
 		if resp.StatusCode == http.StatusUnauthorized {
 			resp.Body.Close()
@@ -164,7 +219,12 @@ func (g *Gateway) Proxy(w http.ResponseWriter, r *http.Request) {
 		copyHeaders(w.Header(), resp.Header, excludeRespHeaders)
 		w.WriteHeader(resp.StatusCode)
 		finalStatus = resp.StatusCode
-		g.streamCopy(w, resp.Body)
+		responseStats := streamCopyWithCompatibility(
+			w, resp.Body, resp.Header.Get("Content-Type"), namespaceMappings, start,
+			streamCompatibilityOptions{fillAnthropicIndexes: r.URL.Path == "/v1/messages"},
+		)
+		responseStats.Stream = metrics.Stream
+		metrics = responseStats
 		resp.Body.Close()
 		g.pool.Release(a, time.Now())
 		break
@@ -174,7 +234,7 @@ func (g *Gateway) Proxy(w http.ResponseWriter, r *http.Request) {
 		finalStatus = http.StatusServiceUnavailable
 		g.writeError(w, finalStatus, "所有账号暂不可用或均在冷却中")
 	}
-	g.log(r, acct, model, upstreamPath, finalStatus, start)
+	g.log(r, acct, model, upstreamPath, finalStatus, start, metrics)
 }
 
 func (g *Gateway) doRequest(r *http.Request, token string, body []byte, upstreamPath string) (*http.Response, error) {
@@ -189,22 +249,7 @@ func (g *Gateway) doRequest(r *http.Request, token string, body []byte, upstream
 }
 
 func (g *Gateway) streamCopy(w http.ResponseWriter, body io.Reader) {
-	flusher, ok := w.(http.Flusher)
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := body.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
-			}
-			if ok {
-				flusher.Flush()
-			}
-		}
-		if err != nil {
-			break
-		}
-	}
+	streamCopyRaw(w, body)
 }
 
 // ---------- /models 聚合 ----------
@@ -341,7 +386,7 @@ func (g *Gateway) HandleTTS(w http.ResponseWriter, r *http.Request) {
 		copyHeaders(w.Header(), resp.Header, excludeRespHeaders)
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)
-		g.log(r, acct, in.Model, "/v1/tts", resp.StatusCode, start)
+		g.log(r, acct, in.Model, "/v1/tts", resp.StatusCode, start, responseMetrics{})
 		return
 	}
 
@@ -363,7 +408,7 @@ func (g *Gateway) HandleTTS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", strconv.Itoa(len(raw)))
 	w.WriteHeader(http.StatusOK)
 	w.Write(raw)
-	g.log(r, acct, in.Model, "/v1/tts", http.StatusOK, start)
+	g.log(r, acct, in.Model, "/v1/tts", http.StatusOK, start, responseMetrics{})
 }
 
 // ---------- STT：OpenAI /audio/transcriptions → xAI /stt（multipart 原样转发） ----------
@@ -382,7 +427,7 @@ func (g *Gateway) HandleSTT(w http.ResponseWriter, r *http.Request) {
 	copyHeaders(w.Header(), resp.Header, excludeRespHeaders)
 	w.WriteHeader(resp.StatusCode)
 	g.streamCopy(w, resp.Body)
-	g.log(r, acct, "stt", "/v1/stt", resp.StatusCode, start)
+	g.log(r, acct, "stt", "/v1/stt", resp.StatusCode, start, responseMetrics{})
 }
 
 // simpleUpstream 单次上游请求（不重试）。成功时由调用方 Release。
@@ -413,33 +458,7 @@ func (g *Gateway) simpleUpstream(r *http.Request, method, path string, body []by
 		g.pool.Release(a, time.Now())
 		return nil, nil, err
 	}
-	g.captureRateLimit(a, resp)
 	return resp, a, nil
-}
-
-// ---------- 限流头捕获 ----------
-
-func atoiHeader(h http.Header, key string) int {
-	v := strings.TrimSpace(h.Get(key))
-	if v == "" {
-		return 0
-	}
-	n, _ := strconv.Atoi(v)
-	return n
-}
-
-func (g *Gateway) captureRateLimit(acct *pool.Account, resp *http.Response) {
-	if acct == nil || resp == nil {
-		return
-	}
-	limit := atoiHeader(resp.Header, "X-Ratelimit-Limit-Requests")
-	remaining := atoiHeader(resp.Header, "X-Ratelimit-Remaining-Requests")
-	tokenLimit := atoiHeader(resp.Header, "X-Ratelimit-Limit-Tokens")
-	tokenRemaining := atoiHeader(resp.Header, "X-Ratelimit-Remaining-Tokens")
-	if limit == 0 && remaining == 0 && tokenLimit == 0 && tokenRemaining == 0 {
-		return
-	}
-	g.pool.UpdateRateLimit(acct.ID, limit, remaining, tokenLimit, tokenRemaining)
 }
 
 // ---------- 工具 ----------
@@ -450,10 +469,18 @@ func (g *Gateway) writeError(w http.ResponseWriter, status int, msg string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
-func (g *Gateway) log(r *http.Request, acct *pool.Account, model, endpoint string, status int, start time.Time) {
+func (g *Gateway) log(
+	r *http.Request,
+	acct *pool.Account,
+	model, endpoint string,
+	status int,
+	start time.Time,
+	metrics responseMetrics,
+) {
 	if status == 0 {
 		return
 	}
+	totalLatencyMs := int(time.Since(start).Milliseconds())
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
@@ -467,12 +494,17 @@ func (g *Gateway) log(r *http.Request, acct *pool.Account, model, endpoint strin
 		g.store.TouchLastUsed(ctx, id)
 	}
 	l := store.CallLog{
-		KeyID:     keyID,
-		AccountID: accountID,
-		Model:     model,
-		Endpoint:  endpoint,
-		Status:    status,
-		LatencyMs: int(time.Since(start).Milliseconds()),
+		KeyID:            keyID,
+		AccountID:        accountID,
+		Model:            model,
+		Endpoint:         endpoint,
+		Status:           status,
+		PromptTokens:     metrics.InputTokens,
+		CachedTokens:     metrics.CachedInputTokens,
+		CompletionTokens: metrics.OutputTokens,
+		TTFTMs:           metrics.TTFTMs,
+		LatencyMs:        totalLatencyMs,
+		Stream:           metrics.Stream,
 	}
 	if err := g.store.InsertCallLog(ctx, l); err != nil {
 		log.Printf("写入调用记录失败: %v", err)

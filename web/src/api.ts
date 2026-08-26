@@ -22,10 +22,12 @@ export interface Account {
   created_at: string
   updated_at: string
   last_used_at: string | null
-  rl_limit: number
-  rl_remaining: number
-  rl_token_limit: number
-  rl_token_remaining: number
+  subscription_tier: string
+  weekly_used_percent: number | null
+  weekly_reset_at: string | null
+  reset_credits_known: boolean
+  reset_credits_available: number
+  reset_credit_expires_at: string | null
 }
 
 export interface KeyItem {
@@ -44,11 +46,63 @@ export interface LogItem {
   endpoint: string
   status: number
   prompt_tokens: number
+  cached_tokens: number
   completion_tokens: number
+  ttft_ms: number
   latency_ms: number
+  stream: boolean
   created_at: string
   key_name: string
   account_email: string
+}
+
+export interface LogListResponse {
+  items: LogItem[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface DashboardPoint {
+  timestamp: string
+  calls: number
+  input_tokens: number
+  cached_tokens: number
+  output_tokens: number
+  cost_usd: number
+}
+
+export interface DashboardTotals {
+  calls: number
+  input_tokens: number
+  cached_tokens: number
+  output_tokens: number
+  cost_usd: number
+}
+
+export interface ModelPricing {
+  model: string
+  canonical_model: string
+  input_usd_per_million: number
+  cached_usd_per_million: number
+  output_usd_per_million: number
+  long_input_usd_per_million: number
+  long_cached_usd_per_million: number
+  long_output_usd_per_million: number
+  long_context_threshold: number
+}
+
+export interface DashboardResponse {
+  range_minutes: number
+  timezone: string
+  from: string
+  to: string
+  points: DashboardPoint[]
+  totals: DashboardTotals
+  pricing: ModelPricing[]
+  unpriced_models: string[]
+  pricing_source: string
+  pricing_as_of: string
 }
 
 export async function api<T>(path: string, opts: RequestInit = {}): Promise<T> {

@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"grok2api/server/internal/auth"
+	"grok2api/server/internal/billing"
 	"grok2api/server/internal/config"
 	"grok2api/server/internal/oauth"
 	"grok2api/server/internal/pool"
@@ -297,13 +298,31 @@ func (h *Handler) pollDevice(flow *deviceFlow) {
 	}
 }
 
-
 type accountView struct {
 	store.AccountRecord
-	RLLimit          int `json:"rl_limit"`
-	RLRemaining      int `json:"rl_remaining"`
-	RLTokenLimit     int `json:"rl_token_limit"`
-	RLTokenRemaining int `json:"rl_token_remaining"`
+	SubscriptionTier      string     `json:"subscription_tier"`
+	WeeklyUsedPercent     *float64   `json:"weekly_used_percent"`
+	WeeklyResetAt         *time.Time `json:"weekly_reset_at"`
+	ResetCreditsKnown     bool       `json:"reset_credits_known"`
+	ResetCreditsAvailable int        `json:"reset_credits_available"`
+	ResetCreditExpiresAt  *time.Time `json:"reset_credit_expires_at"`
+}
+
+func applyAccountUsage(v *accountView, usage billing.Usage) {
+	v.SubscriptionTier = usage.SubscriptionTier
+	v.WeeklyUsedPercent = &usage.WeeklyUsedPercent
+	if !usage.WeeklyResetAt.IsZero() {
+		v.WeeklyResetAt = &usage.WeeklyResetAt
+	}
+	v.ResetCreditsKnown = !usage.ResetCreditsUpdatedAt.IsZero()
+	if !v.ResetCreditsKnown {
+		return
+	}
+	available := usage.AvailableResetCredits(time.Now())
+	v.ResetCreditsAvailable = len(available)
+	if len(available) > 0 && !available[0].ExpiresAt.IsZero() {
+		v.ResetCreditExpiresAt = &available[0].ExpiresAt
+	}
 }
 
 func (h *Handler) ListAccounts(w http.ResponseWriter, r *http.Request) {
@@ -315,15 +334,38 @@ func (h *Handler) ListAccounts(w http.ResponseWriter, r *http.Request) {
 	out := make([]accountView, 0, len(accs))
 	for _, a := range accs {
 		v := accountView{AccountRecord: a}
-		if limit, remaining, tokenLimit, tokenRemaining, ok := h.pool.Usage(a.ID); ok {
-			v.RLLimit = limit
-			v.RLRemaining = remaining
-			v.RLTokenLimit = tokenLimit
-			v.RLTokenRemaining = tokenRemaining
+		if usage, ok := h.pool.BillingUsage(a.ID); ok {
+			applyAccountUsage(&v, usage)
 		}
 		out = append(out, v)
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func (h *Handler) RedeemAccountReset(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "无效的账号 id")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	usage, err := h.pool.RedeemReset(ctx, id)
+	if err != nil {
+		switch {
+		case errors.Is(err, pool.ErrAccountNotFound):
+			writeErr(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, billing.ErrNoResetCredit):
+			writeErr(w, http.StatusConflict, err.Error())
+		default:
+			writeErr(w, http.StatusBadGateway, "重置周限失败："+err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":                  true,
+		"weekly_used_percent": usage.WeeklyUsedPercent,
+	})
 }
 
 func (h *Handler) DeleteAccount(w http.ResponseWriter, r *http.Request) {
@@ -390,23 +432,41 @@ func (h *Handler) DeleteKey(w http.ResponseWriter, r *http.Request) {
 
 // ---------- 调用记录 ----------
 
-func (h *Handler) ListLogs(w http.ResponseWriter, r *http.Request) {
-	limit := 100
+type logListResponse struct {
+	Items  []store.CallLog `json:"items"`
+	Total  int64           `json:"total"`
+	Limit  int             `json:"limit"`
+	Offset int             `json:"offset"`
+}
+
+func parseLogPagination(r *http.Request) (limit, offset int) {
+	limit = 50
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 1000 {
 			limit = n
 		}
 	}
-	offset := 0
 	if v := r.URL.Query().Get("offset"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			offset = n
 		}
+	}
+	return limit, offset
+}
+
+func (h *Handler) ListLogs(w http.ResponseWriter, r *http.Request) {
+	limit, offset := parseLogPagination(r)
+	total, err := h.store.CountCallLogs(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 	logs, err := h.store.ListCallLogs(r.Context(), limit, offset)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, logs)
+	writeJSON(w, http.StatusOK, logListResponse{
+		Items: logs, Total: total, Limit: limit, Offset: offset,
+	})
 }

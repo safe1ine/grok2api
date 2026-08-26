@@ -2,11 +2,16 @@
 export default {
   content: ['./index.html', './src/**/*.{ts,tsx}'],
   theme: {
-    extend: {},
+    extend: {
+      fontFamily: {
+        sans: ['Maple UI', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+        mono: ['Maple UI', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+      },
+    },
   },
   plugins: [require('daisyui')],
   daisyui: {
-    themes: ['dark', 'light'],
-    darkTheme: 'dark',
+    themes: ['fantasy'],
+    darkTheme: false,
   },
 }

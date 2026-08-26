@@ -12,15 +12,18 @@ import (
 
 type Config struct {
 	Port        string
+	ListenHost  string
 	DatabaseURL string
 
 	// xAI OAuth
-	XAIAuthBase    string
-	XAIAPIBase     string
-	XAIClientID    string
-	XAIClientSecret string // 公开客户端 + PKCE 时可为空
-	XAIScope       string
-	XAIRedirectURI string
+	XAIAuthBase      string
+	XAIAPIBase       string
+	XAIChatProxyBase string
+	XAIGrokWebBase   string
+	XAIClientID      string
+	XAIClientSecret  string // 公开客户端 + PKCE 时可为空
+	XAIScope         string
+	XAIRedirectURI   string
 
 	// 管理台
 	AdminUsername string
@@ -58,18 +61,21 @@ func Load() (*Config, error) {
 	_ = godotenv.Load()
 
 	cfg := &Config{
-		Port:            getenv("PORT", "30081"),
-		DatabaseURL:     os.Getenv("DATABASE_URL"),
-		XAIAuthBase:     strings.TrimRight(getenv("XAI_AUTH_BASE", "https://auth.x.ai"), "/"),
-		XAIAPIBase:      strings.TrimRight(getenv("XAI_API_BASE", "https://api.x.ai"), "/"),
-		XAIClientID:     getenv("XAI_CLIENT_ID", "b1a00492-073a-47ea-816f-4c329264a828"),
-		XAIClientSecret: os.Getenv("XAI_CLIENT_SECRET"),
-		XAIScope:        getenv("XAI_SCOPE", "openid profile email offline_access grok-cli:access api:access"),
-		XAIRedirectURI:  getenv("XAI_REDIRECT_URI", "http://localhost:30081/api/oauth/callback"),
-		AdminUsername:   getenv("ADMIN_USERNAME", "admin"),
-		AdminPassword:   os.Getenv("ADMIN_PASSWORD"),
-		RequireAuth:     parseBool(getenv("REQUIRE_AUTH", "true")),
-		WebDist:         os.Getenv("WEB_DIST"),
+		Port:             getenv("PORT", "30081"),
+		ListenHost:       os.Getenv("LISTEN_HOST"),
+		DatabaseURL:      os.Getenv("DATABASE_URL"),
+		XAIAuthBase:      strings.TrimRight(getenv("XAI_AUTH_BASE", "https://auth.x.ai"), "/"),
+		XAIAPIBase:       strings.TrimRight(getenv("XAI_API_BASE", "https://api.x.ai"), "/"),
+		XAIChatProxyBase: strings.TrimRight(getenv("XAI_CHAT_PROXY_BASE", "https://cli-chat-proxy.grok.com/v1"), "/"),
+		XAIGrokWebBase:   strings.TrimRight(getenv("XAI_GROK_WEB_BASE", "https://grok.com"), "/"),
+		XAIClientID:      getenv("XAI_CLIENT_ID", "b1a00492-073a-47ea-816f-4c329264a828"),
+		XAIClientSecret:  os.Getenv("XAI_CLIENT_SECRET"),
+		XAIScope:         getenv("XAI_SCOPE", "openid profile email offline_access grok-cli:access api:access"),
+		XAIRedirectURI:   getenv("XAI_REDIRECT_URI", "http://localhost:30081/api/oauth/callback"),
+		AdminUsername:    getenv("ADMIN_USERNAME", "admin"),
+		AdminPassword:    os.Getenv("ADMIN_PASSWORD"),
+		RequireAuth:      parseBool(getenv("REQUIRE_AUTH", "true")),
+		WebDist:          os.Getenv("WEB_DIST"),
 	}
 
 	var missing []string

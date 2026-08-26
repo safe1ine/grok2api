@@ -1,20 +1,21 @@
 package pool
 
 import (
-	"container/heap"
 	"context"
 	"errors"
 	"log"
 	"sync"
 	"time"
 
+	"grok2api/server/internal/billing"
 	"grok2api/server/internal/oauth"
 	"grok2api/server/internal/store"
 )
 
 var (
-	ErrNoAccount      = errors.New("没有可用账号")
-	ErrAllCoolingDown = errors.New("所有账号都在冷却中")
+	ErrNoAccount       = errors.New("没有可用账号")
+	ErrAllCoolingDown  = errors.New("所有账号都在冷却中")
+	ErrAccountNotFound = errors.New("账号不存在或未启用")
 )
 
 type Account struct {
@@ -26,45 +27,35 @@ type Account struct {
 	ExpiresAt     time.Time
 	CooldownUntil time.Time
 
-	// 最近一次请求的限流信息（内存态，随每次请求更新）
-	RLLimit          int
-	RLRemaining      int
-	RLTokenLimit     int
-	RLTokenRemaining int
+	// Grok 订阅周用量（内存缓存，由 billing endpoint 定期刷新）。
+	BillingUsage billing.Usage
 
-	mu sync.Mutex
+	mu      sync.Mutex
+	resetMu sync.Mutex // 序列化同一账号的重置券兑换，避免重复消费。
 
-	// checkedOut 表示账号正在被某个请求独占使用（已从堆弹出，尚未归还）。
-	// 仅由 p.mu 保护，rebuildHeap 时据此避免把在途账号重复入堆。
-	checkedOut bool
-}
-
-// accountHeap 按 CooldownUntil 的最小堆。
-type accountHeap []*Account
-
-func (h accountHeap) Len() int           { return len(h) }
-func (h accountHeap) Less(i, j int) bool { return h[i].CooldownUntil.Before(h[j].CooldownUntil) }
-func (h accountHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *accountHeap) Push(x any)        { *h = append(*h, x.(*Account)) }
-func (h *accountHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[:n-1]
-	return x
+	// inFlight 和 lastAssigned 仅由 Pool.mu 保护，用于并发最少优先的账号选择。
+	inFlight     int
+	lastAssigned uint64
 }
 
 type Pool struct {
-	store *store.Store
-	oauth *oauth.Client
+	store   *store.Store
+	oauth   *oauth.Client
+	billing *billing.Client
 
-	mu   sync.Mutex
-	byID map[int64]*Account
-	heap accountHeap
+	mu      sync.Mutex
+	byID    map[int64]*Account
+	pickSeq uint64
 }
 
 func New(s *store.Store, oc *oauth.Client) *Pool {
-	return &Pool{store: s, oauth: oc, byID: map[int64]*Account{}, heap: accountHeap{}}
+	return &Pool{store: s, oauth: oc, byID: map[int64]*Account{}}
+}
+
+func (p *Pool) SetBillingClient(client *billing.Client) {
+	p.mu.Lock()
+	p.billing = client
+	p.mu.Unlock()
 }
 
 // Reload 从数据库全量载入账号（仅 active 状态）。
@@ -76,7 +67,7 @@ func (p *Pool) Reload(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.byID = map[int64]*Account{}
-	p.heap = accountHeap{}
+	p.pickSeq = 0
 	now := time.Now()
 	for _, r := range recs {
 		a := &Account{
@@ -87,7 +78,6 @@ func (p *Pool) Reload(ctx context.Context) error {
 			CooldownUntil: now,
 		}
 		p.byID[r.ID] = a
-		heap.Push(&p.heap, a)
 	}
 	return nil
 }
@@ -95,8 +85,6 @@ func (p *Pool) Reload(ctx context.Context) error {
 // AddAccount 新增账号；若 id 已存在（重新授权）则原地更新 refresh_token。
 func (p *Pool) AddAccount(id int64, email, refreshToken string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if a, ok := p.byID[id]; ok {
 		a.mu.Lock()
 		a.RefreshToken = refreshToken
@@ -104,62 +92,71 @@ func (p *Pool) AddAccount(id int64, email, refreshToken string) {
 		a.Status = "active"
 		a.AccessToken = "" // 旧 access_token 作废
 		a.mu.Unlock()
-		return
+	} else {
+		p.byID[id] = &Account{
+			ID:            id,
+			Email:         email,
+			Status:        "active",
+			RefreshToken:  refreshToken,
+			CooldownUntil: time.Now(),
+		}
 	}
-
-	a := &Account{
-		ID:            id,
-		Email:         email,
-		Status:        "active",
-		RefreshToken:  refreshToken,
-		CooldownUntil: time.Now(),
-	}
-	p.byID[id] = a
-	heap.Push(&p.heap, a)
+	p.mu.Unlock()
+	p.refreshBillingAsync(id)
 }
 
-// Acquire 取出一个空闲且未冷却的账号（每账号独占）。
+// Acquire 选择一个未冷却且当前并发最少的账号。
+// 账号不会被独占移出池，同一账号可以同时服务多个请求。
 func (p *Pool) Acquire() (*Account, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.heap.Len() == 0 {
+	if len(p.byID) == 0 {
 		return nil, ErrNoAccount
 	}
-	top := p.heap[0]
-	if top.CooldownUntil.After(time.Now()) {
+
+	now := time.Now()
+	var best *Account
+	for _, a := range p.byID {
+		if a.CooldownUntil.After(now) {
+			continue
+		}
+		if best == nil || a.inFlight < best.inFlight ||
+			(a.inFlight == best.inFlight && a.lastAssigned < best.lastAssigned) {
+			best = a
+		}
+	}
+	if best == nil {
 		return nil, ErrAllCoolingDown
 	}
-	a := heap.Pop(&p.heap).(*Account)
-	a.checkedOut = true
-	return a, nil
+
+	p.pickSeq++
+	best.inFlight++
+	best.lastAssigned = p.pickSeq
+	return best, nil
 }
 
-// Release 归还账号；cooldownUntil 为下次可用的最早时间。
+// Release 结束一次账号租用；cooldownUntil 为下次可分配的最早时间。
+// 并发场景下已有冷却只能延长，不能被其他成功请求的 Release 提前清除。
 func (p *Pool) Release(a *Account, cooldownUntil time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if _, ok := p.byID[a.ID]; !ok {
-		return // 已被删除
+	current, ok := p.byID[a.ID]
+	if !ok || current != a {
+		return // 已被删除或重新加载
 	}
-	if !a.checkedOut {
-		return // 防重复归还
+	if a.inFlight > 0 {
+		a.inFlight--
 	}
-	a.checkedOut = false
-	now := time.Now()
-	if cooldownUntil.After(now) {
+	if cooldownUntil.After(a.CooldownUntil) {
 		a.CooldownUntil = cooldownUntil
-	} else {
-		a.CooldownUntil = now
 	}
-	heap.Push(&p.heap, a)
 }
 
-// Remove 从池中移除账号（管理员删除）。
+// Remove 从池中移除账号。
 func (p *Pool) Remove(id int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.byID, id)
-	p.rebuildHeap()
 }
 
 // Invalidate 让账号缓存的 access_token 失效，下次 Token() 会强制刷新。
@@ -173,15 +170,6 @@ func (a *Account) Invalidate() {
 func (p *Pool) MarkNeedRelogin(ctx context.Context, a *Account) {
 	_ = p.store.SetAccountStatus(ctx, a.ID, "need_relogin")
 	p.Remove(a.ID)
-}
-
-func (p *Pool) rebuildHeap() {
-	p.heap = accountHeap{}
-	for _, a := range p.byID {
-		if !a.checkedOut {
-			heap.Push(&p.heap, a)
-		}
-	}
 }
 
 // Token 返回账号可用 access_token，必要时刷新（账号级加锁）。
@@ -222,31 +210,168 @@ func (p *Pool) Len() int {
 	return len(p.byID)
 }
 
-// UpdateRateLimit 更新账号最近一次请求的限流信息。
-func (p *Pool) UpdateRateLimit(id int64, limit, remaining, tokenLimit, tokenRemaining int) {
+// RefreshBilling 刷新所有账号的订阅等级、周用量和重置时间。
+func (p *Pool) RefreshBilling(ctx context.Context) {
 	p.mu.Lock()
-	a, ok := p.byID[id]
-	p.mu.Unlock()
-	if !ok {
-		return
+	ids := make([]int64, 0, len(p.byID))
+	for id := range p.byID {
+		ids = append(ids, id)
 	}
-	a.mu.Lock()
-	a.RLLimit = limit
-	a.RLRemaining = remaining
-	a.RLTokenLimit = tokenLimit
-	a.RLTokenRemaining = tokenRemaining
-	a.mu.Unlock()
+	p.mu.Unlock()
+
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := p.refreshBillingAccount(ctx, id); err != nil {
+				log.Printf("刷新账号 %d Grok 周用量失败: %v", id, err)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
-// Usage 返回账号最近一次请求的限流信息。
-func (p *Pool) Usage(id int64) (limit, remaining, tokenLimit, tokenRemaining int, ok bool) {
+// BillingUsage 返回账号最近一次成功获取的真实订阅周用量。
+func (p *Pool) BillingUsage(id int64) (billing.Usage, bool) {
 	p.mu.Lock()
 	a, ok := p.byID[id]
 	p.mu.Unlock()
 	if !ok {
-		return 0, 0, 0, 0, false
+		return billing.Usage{}, false
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.RLLimit, a.RLRemaining, a.RLTokenLimit, a.RLTokenRemaining, true
+	usage := cloneBillingUsage(a.BillingUsage)
+	return usage, !usage.UpdatedAt.IsZero()
+}
+
+// RedeemReset 重新查询账号的有效重置券，消费最早过期的一张，并刷新账号用量。
+func (p *Pool) RedeemReset(ctx context.Context, id int64) (billing.Usage, error) {
+	p.mu.Lock()
+	a, ok := p.byID[id]
+	client := p.billing
+	p.mu.Unlock()
+	if !ok || client == nil {
+		return billing.Usage{}, ErrAccountNotFound
+	}
+
+	a.resetMu.Lock()
+	defer a.resetMu.Unlock()
+
+	accessToken, err := p.Token(ctx, a)
+	if err != nil {
+		return billing.Usage{}, err
+	}
+	credits, err := client.FetchResetCredits(ctx, accessToken)
+	if err != nil {
+		return billing.Usage{}, err
+	}
+	now := time.Now()
+	freshResetUsage := billing.Usage{ResetCredits: credits, ResetCreditsUpdatedAt: now}
+	available := freshResetUsage.AvailableResetCredits(now)
+	if len(available) == 0 {
+		a.mu.Lock()
+		a.BillingUsage.ResetCredits = append([]billing.ResetCredit(nil), credits...)
+		a.BillingUsage.ResetCreditsUpdatedAt = now
+		usage := cloneBillingUsage(a.BillingUsage)
+		a.mu.Unlock()
+		return usage, billing.ErrNoResetCredit
+	}
+
+	credit := available[0]
+	if err := client.RedeemReset(ctx, accessToken, credit.TokenID); err != nil {
+		return billing.Usage{}, err
+	}
+
+	// 成功后立即从本地缓存移除，避免上游短暂最终一致时重复显示或再次兑换。
+	remaining := make([]billing.ResetCredit, 0, len(credits)-1)
+	for _, candidate := range credits {
+		if candidate.TokenID != credit.TokenID {
+			remaining = append(remaining, candidate)
+		}
+	}
+	a.mu.Lock()
+	a.BillingUsage.ResetCredits = remaining
+	a.BillingUsage.ResetCreditsUpdatedAt = time.Now()
+	a.mu.Unlock()
+
+	if refreshed, refreshErr := client.Fetch(ctx, accessToken); refreshErr == nil {
+		if refreshed.ResetCreditsUpdatedAt.IsZero() {
+			refreshed.ResetCredits = remaining
+			refreshed.ResetCreditsUpdatedAt = time.Now()
+		} else {
+			filtered := refreshed.ResetCredits[:0]
+			for _, candidate := range refreshed.ResetCredits {
+				if candidate.TokenID != credit.TokenID {
+					filtered = append(filtered, candidate)
+				}
+			}
+			refreshed.ResetCredits = filtered
+		}
+		a.mu.Lock()
+		mergeBillingUsage(a, refreshed)
+		a.mu.Unlock()
+	}
+
+	a.mu.Lock()
+	usage := cloneBillingUsage(a.BillingUsage)
+	a.mu.Unlock()
+	return usage, nil
+}
+
+func (p *Pool) refreshBillingAsync(id int64) {
+	p.mu.Lock()
+	enabled := p.billing != nil
+	p.mu.Unlock()
+	if !enabled {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		if err := p.refreshBillingAccount(ctx, id); err != nil {
+			log.Printf("刷新账号 %d Grok 周用量失败: %v", id, err)
+		}
+	}()
+}
+
+func (p *Pool) refreshBillingAccount(ctx context.Context, id int64) error {
+	p.mu.Lock()
+	a, ok := p.byID[id]
+	client := p.billing
+	p.mu.Unlock()
+	if !ok || client == nil {
+		return nil
+	}
+	accessToken, err := p.Token(ctx, a)
+	if err != nil {
+		return err
+	}
+	usage, err := client.Fetch(ctx, accessToken)
+	if err != nil {
+		return err
+	}
+	a.mu.Lock()
+	mergeBillingUsage(a, usage)
+	a.mu.Unlock()
+	return nil
+}
+
+func mergeBillingUsage(a *Account, usage billing.Usage) {
+	if usage.SubscriptionTier == "" {
+		usage.SubscriptionTier = a.BillingUsage.SubscriptionTier
+	}
+	if usage.ResetCreditsUpdatedAt.IsZero() {
+		usage.ResetCredits = append([]billing.ResetCredit(nil), a.BillingUsage.ResetCredits...)
+		usage.ResetCreditsUpdatedAt = a.BillingUsage.ResetCreditsUpdatedAt
+	} else {
+		usage.ResetCredits = append([]billing.ResetCredit(nil), usage.ResetCredits...)
+	}
+	a.BillingUsage = usage
+}
+
+func cloneBillingUsage(usage billing.Usage) billing.Usage {
+	usage.ResetCredits = append([]billing.ResetCredit(nil), usage.ResetCredits...)
+	return usage
 }

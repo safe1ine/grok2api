@@ -7,6 +7,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -41,19 +42,32 @@ type KeyRecord struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+type MinuteUsage struct {
+	Minute           time.Time
+	Model            string
+	LongContext      bool
+	Calls            int64
+	PromptTokens     int64
+	CachedTokens     int64
+	CompletionTokens int64
+}
+
 type CallLog struct {
-	ID               int64      `json:"id"`
-	KeyID            *int64     `json:"key_id"`
-	AccountID        *int64     `json:"account_id"`
-	Model            string     `json:"model"`
-	Endpoint         string     `json:"endpoint"`
-	Status           int        `json:"status"`
-	PromptTokens     int        `json:"prompt_tokens"`
-	CompletionTokens int        `json:"completion_tokens"`
-	LatencyMs        int        `json:"latency_ms"`
-	CreatedAt        time.Time  `json:"created_at"`
-	KeyName          string     `json:"key_name"`
-	AccountEmail     string     `json:"account_email"`
+	ID               int64     `json:"id"`
+	KeyID            *int64    `json:"key_id"`
+	AccountID        *int64    `json:"account_id"`
+	Model            string    `json:"model"`
+	Endpoint         string    `json:"endpoint"`
+	Status           int       `json:"status"`
+	PromptTokens     int       `json:"prompt_tokens"`
+	CachedTokens     int       `json:"cached_tokens"`
+	CompletionTokens int       `json:"completion_tokens"`
+	TTFTMs           int       `json:"ttft_ms"`
+	LatencyMs        int       `json:"latency_ms"`
+	Stream           bool      `json:"stream"`
+	CreatedAt        time.Time `json:"created_at"`
+	KeyName          string    `json:"key_name"`
+	AccountEmail     string    `json:"account_email"`
 }
 
 type Store struct {
@@ -80,11 +94,40 @@ func New(ctx context.Context, dbURL string, encKey []byte) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
+	if err := s.EnsureCallLogPartitions(ctx, time.Now()); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("创建调用记录分区失败: %w", err)
+	}
 	return s, nil
 }
 
 func (s *Store) Close() {
 	s.pool.Close()
+}
+
+// EnsureCallLogPartitions 提前创建当天及未来 7 天的调用记录分区。
+// 分区边界使用 Asia/Shanghai 自然日，表名格式为 call_logs_YYYYMMDD。
+func (s *Store) EnsureCallLogPartitions(ctx context.Context, now time.Time) error {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		return fmt.Errorf("加载分区时区失败: %w", err)
+	}
+	now = now.In(loc)
+	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+
+	for offset := 0; offset <= 7; offset++ {
+		start := day.AddDate(0, 0, offset)
+		end := start.AddDate(0, 0, 1)
+		name := "call_logs_" + start.Format("20060102")
+		query := fmt.Sprintf(
+			"CREATE TABLE IF NOT EXISTS %s PARTITION OF call_logs FOR VALUES FROM ('%s') TO ('%s')",
+			pgx.Identifier{name}.Sanitize(), start.Format(time.RFC3339), end.Format(time.RFC3339),
+		)
+		if _, err := s.pool.Exec(ctx, query); err != nil {
+			return fmt.Errorf("创建分区 %s 失败: %w", name, err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -303,17 +346,56 @@ func (s *Store) ListActiveKeyHashes(ctx context.Context) (map[string]int64, erro
 
 func (s *Store) InsertCallLog(ctx context.Context, l CallLog) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO call_logs (key_id, account_id, model, endpoint, status, prompt_tokens, completion_tokens, latency_ms)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		l.KeyID, l.AccountID, l.Model, l.Endpoint, l.Status, l.PromptTokens, l.CompletionTokens, l.LatencyMs)
+		INSERT INTO call_logs (
+			key_id, account_id, model, endpoint, status, prompt_tokens, cached_tokens,
+			completion_tokens, ttft_ms, latency_ms, stream
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		l.KeyID, l.AccountID, l.Model, l.Endpoint, l.Status, l.PromptTokens, l.CachedTokens,
+		l.CompletionTokens, l.TTFTMs, l.LatencyMs, l.Stream)
 	return err
+}
+
+func (s *Store) CountCallLogs(ctx context.Context) (int64, error) {
+	var total int64
+	err := s.pool.QueryRow(ctx, `SELECT count(*) FROM call_logs`).Scan(&total)
+	return total, err
+}
+
+func (s *Store) ListMinuteUsage(ctx context.Context, start, end time.Time) ([]MinuteUsage, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT date_trunc('minute', created_at) AS minute,
+		       COALESCE(model, ''), prompt_tokens > 200000 AS long_context,
+		       count(*), COALESCE(sum(prompt_tokens), 0), COALESCE(sum(cached_tokens), 0),
+		       COALESCE(sum(completion_tokens), 0)
+		FROM call_logs
+		WHERE created_at >= $1 AND created_at < $2
+		GROUP BY minute, COALESCE(model, ''), long_context
+		ORDER BY minute`, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]MinuteUsage, 0)
+	for rows.Next() {
+		var usage MinuteUsage
+		if err := rows.Scan(
+			&usage.Minute, &usage.Model, &usage.LongContext, &usage.Calls,
+			&usage.PromptTokens, &usage.CachedTokens, &usage.CompletionTokens,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, usage)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) ListCallLogs(ctx context.Context, limit, offset int) ([]CallLog, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT l.id, l.key_id, l.account_id, l.model, l.endpoint, l.status,
-		       l.prompt_tokens, l.completion_tokens, l.latency_ms, l.created_at,
-		       k.name, a.email
+		       l.prompt_tokens, l.cached_tokens, l.completion_tokens,
+		       l.ttft_ms, l.latency_ms, l.stream, l.created_at, k.name, a.email
 		FROM call_logs l
 		LEFT JOIN api_keys k ON k.id = l.key_id
 		LEFT JOIN accounts a ON a.id = l.account_id
@@ -328,7 +410,8 @@ func (s *Store) ListCallLogs(ctx context.Context, limit, offset int) ([]CallLog,
 		var l CallLog
 		var model, endpoint, keyName, accountEmail *string
 		if err := rows.Scan(&l.ID, &l.KeyID, &l.AccountID, &model, &endpoint, &l.Status,
-			&l.PromptTokens, &l.CompletionTokens, &l.LatencyMs, &l.CreatedAt, &keyName, &accountEmail); err != nil {
+			&l.PromptTokens, &l.CachedTokens, &l.CompletionTokens, &l.TTFTMs, &l.LatencyMs,
+			&l.Stream, &l.CreatedAt, &keyName, &accountEmail); err != nil {
 			return nil, err
 		}
 		if model != nil {
