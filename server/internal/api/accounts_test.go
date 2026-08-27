@@ -5,7 +5,21 @@ import (
 	"time"
 
 	"grok2api/server/internal/billing"
+	"grok2api/server/internal/pool"
 )
+
+func TestApplyAccountStateUsesSchedulerStatus(t *testing.T) {
+	until := time.Now().Add(time.Hour)
+	view := accountView{}
+	view.Status = "active"
+	applyAccountState(&view, pool.AccountState{
+		Status:        pool.StatusExhausted,
+		CooldownUntil: &until,
+	})
+	if view.Status != pool.StatusExhausted || view.CooldownUntil == nil || !view.CooldownUntil.Equal(until) {
+		t.Fatalf("view = %+v", view)
+	}
+}
 
 func TestApplyAccountUsageReportsAvailableResetCreditsWithoutTokenIDs(t *testing.T) {
 	now := time.Now()

@@ -31,8 +31,8 @@ func TestEstimateUsageCostUsesLongContextRates(t *testing.T) {
 	t.Parallel()
 
 	usage := store.MinuteUsage{
-		Model: "grok-4.6", LongContext: true, PromptTokens: 300000,
-		CachedTokens: 200000, CompletionTokens: 10000,
+		Model: "grok-4.6", PromptTokens: 300000, CachedTokens: 200000, CompletionTokens: 10000,
+		LongContextPromptTokens: 300000, LongContextCachedTokens: 200000, LongContextCompletionTokens: 10000,
 	}
 	cost, _, ok := estimateUsageCost(usage)
 	if !ok {
@@ -41,6 +41,23 @@ func TestEstimateUsageCostUsesLongContextRates(t *testing.T) {
 	// 100k × $4 + 200k × $1 + 10k × $12 = $0.72.
 	if math.Abs(cost-0.72) > 1e-12 {
 		t.Fatalf("cost = %.12f, want 0.72", cost)
+	}
+}
+
+func TestEstimateUsageCostCombinesStandardAndLongContextBuckets(t *testing.T) {
+	t.Parallel()
+
+	usage := store.MinuteUsage{
+		Model: "grok-4.6", PromptTokens: 300100, CachedTokens: 200040, CompletionTokens: 10010,
+		LongContextPromptTokens: 300000, LongContextCachedTokens: 200000, LongContextCompletionTokens: 10000,
+	}
+	cost, _, ok := estimateUsageCost(usage)
+	if !ok {
+		t.Fatal("grok-4.6 should have official pricing")
+	}
+	// 普通上下文 $0.0002 + 长上下文 $0.72。
+	if math.Abs(cost-0.7202) > 1e-12 {
+		t.Fatalf("cost = %.12f, want 0.7202", cost)
 	}
 }
 
@@ -63,6 +80,26 @@ func TestEstimateUsageCostDoesNotGuessUnknownModel(t *testing.T) {
 	cost, _, ok := estimateUsageCost(store.MinuteUsage{Model: "unknown", PromptTokens: 1_000_000})
 	if ok || cost != 0 {
 		t.Fatalf("unknown model got cost=%v ok=%v", cost, ok)
+	}
+}
+
+func TestParseDashboardFilters(t *testing.T) {
+	t.Parallel()
+
+	t.Run("model and key", func(t *testing.T) {
+		r := httptest.NewRequest("GET", "/api/dashboard?model=%20grok-4.6%20&key_id=42", nil)
+		filters := parseDashboardFilters(r)
+		if filters.Model != "grok-4.6" || filters.KeyID == nil || *filters.KeyID != 42 {
+			t.Fatalf("filters = %+v", filters)
+		}
+	})
+
+	for _, query := range []string{"", "?key_id=0", "?key_id=-1", "?key_id=bad"} {
+		r := httptest.NewRequest("GET", "/api/dashboard"+query, nil)
+		filters := parseDashboardFilters(r)
+		if filters.KeyID != nil {
+			t.Errorf("query %q: key id = %d, want nil", query, *filters.KeyID)
+		}
 	}
 }
 

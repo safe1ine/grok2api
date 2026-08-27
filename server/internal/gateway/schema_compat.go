@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"reflect"
 	"sort"
 	"strings"
 )
@@ -37,17 +38,23 @@ func normalizeToolSchemas(body []byte) ([]byte, bool) {
 
 		// Anthropic Messages API: tools[].input_schema
 		if schema, ok := tool["input_schema"].(map[string]any); ok {
+			changed = ensureFunctionDescription(tool, "") || changed
+			changed = inlineLocalSchemaRefs(schema) || changed
 			changed = normalizeSchema(schema, true) || changed
 		}
 
 		// OpenAI Responses API: tools[].parameters
 		if schema, ok := tool["parameters"].(map[string]any); ok {
+			changed = ensureFunctionDescription(tool, "") || changed
+			changed = inlineLocalSchemaRefs(schema) || changed
 			changed = normalizeSchema(schema, true) || changed
 		}
 
 		// OpenAI Chat Completions API: tools[].function.parameters
 		if function, ok := tool["function"].(map[string]any); ok {
 			if schema, ok := function["parameters"].(map[string]any); ok {
+				changed = ensureFunctionDescription(function, "") || changed
+				changed = inlineLocalSchemaRefs(schema) || changed
 				changed = normalizeSchema(schema, true) || changed
 			}
 		}
@@ -63,6 +70,175 @@ func normalizeToolSchemas(body []byte) ([]byte, bool) {
 	return normalized, true
 }
 
+// inlineLocalSchemaRefs 将标准 JSON Schema 的本地引用内联。xAI 会把嵌套 items
+// 当成独立 Schema 校验，因而无法从那里解析根级 #/$defs/...。
+// relaxToolParameterRoots 仅在上游明确拒绝工具根 Schema 后使用。
+// 它保留已知属性定义，但移除根级组合约束和 required，交由实际 MCP 工具做最终参数校验。
+func relaxToolParameterRoots(body []byte) ([]byte, bool) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var payload map[string]any
+	if err := dec.Decode(&payload); err != nil {
+		return body, false
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return body, false
+	}
+
+	changed := false
+	tools, _ := payload["tools"].([]any)
+	for _, rawTool := range tools {
+		tool, ok := rawTool.(map[string]any)
+		if !ok {
+			continue
+		}
+		if schema, ok := tool["input_schema"].(map[string]any); ok {
+			changed = relaxRootObjectSchema(schema) || changed
+		}
+		if schema, ok := tool["parameters"].(map[string]any); ok {
+			changed = relaxRootObjectSchema(schema) || changed
+		}
+		if function, ok := tool["function"].(map[string]any); ok {
+			if schema, ok := function["parameters"].(map[string]any); ok {
+				changed = relaxRootObjectSchema(schema) || changed
+			}
+		}
+	}
+	if !changed {
+		return body, false
+	}
+	updated, err := json.Marshal(payload)
+	if err != nil {
+		return body, false
+	}
+	return updated, true
+}
+
+func relaxRootObjectSchema(schema map[string]any) bool {
+	properties, _ := cloneSchemaValue(schema["properties"]).(map[string]any)
+	if properties == nil {
+		properties = map[string]any{}
+	}
+	relaxed := map[string]any{
+		"type":                 "object",
+		"properties":           properties,
+		"required":             []any{},
+		"additionalProperties": true,
+	}
+	if reflect.DeepEqual(schema, relaxed) {
+		return false
+	}
+	clear(schema)
+	for key, value := range relaxed {
+		schema[key] = value
+	}
+	return true
+}
+
+func inlineLocalSchemaRefs(root map[string]any) bool {
+	lookup, ok := cloneSchemaValue(root).(map[string]any)
+	if !ok {
+		return false
+	}
+	changed := inlineLocalSchemaRefsValue(root, lookup, map[string]bool{}, 0)
+	if !containsLocalSchemaRef(root) {
+		if _, exists := root["$defs"]; exists {
+			delete(root, "$defs")
+			changed = true
+		}
+		if _, exists := root["definitions"]; exists {
+			delete(root, "definitions")
+			changed = true
+		}
+	}
+	return changed
+}
+
+func inlineLocalSchemaRefsValue(value any, lookup map[string]any, resolving map[string]bool, depth int) bool {
+	if depth >= 64 {
+		return false
+	}
+	changed := false
+	switch value := value.(type) {
+	case map[string]any:
+		if ref, ok := value["$ref"].(string); ok && strings.HasPrefix(ref, "#/") && !resolving[ref] {
+			if target, ok := resolveLocalSchemaRef(lookup, ref); ok {
+				resolved, _ := cloneSchemaValue(target).(map[string]any)
+				resolving[ref] = true
+				changed = inlineLocalSchemaRefsValue(resolved, lookup, resolving, depth+1) || changed
+				delete(resolving, ref)
+
+				siblings := make(map[string]any, len(value)-1)
+				for key, child := range value {
+					if key != "$ref" {
+						siblings[key] = child
+					}
+				}
+				for _, child := range siblings {
+					changed = inlineLocalSchemaRefsValue(child, lookup, resolving, depth+1) || changed
+				}
+				clear(value)
+				for key, child := range resolved {
+					value[key] = child
+				}
+				for key, child := range siblings {
+					value[key] = child
+				}
+				return true
+			}
+		}
+		for _, child := range value {
+			changed = inlineLocalSchemaRefsValue(child, lookup, resolving, depth+1) || changed
+		}
+	case []any:
+		for _, child := range value {
+			changed = inlineLocalSchemaRefsValue(child, lookup, resolving, depth+1) || changed
+		}
+	}
+	return changed
+}
+
+func cloneSchemaValue(value any) any {
+	switch value := value.(type) {
+	case map[string]any:
+		clone := make(map[string]any, len(value))
+		for key, child := range value {
+			clone[key] = cloneSchemaValue(child)
+		}
+		return clone
+	case []any:
+		clone := make([]any, len(value))
+		for index, child := range value {
+			clone[index] = cloneSchemaValue(child)
+		}
+		return clone
+	default:
+		return value
+	}
+}
+
+func containsLocalSchemaRef(value any) bool {
+	switch value := value.(type) {
+	case map[string]any:
+		if ref, ok := value["$ref"].(string); ok && strings.HasPrefix(ref, "#/") {
+			return true
+		}
+		for _, child := range value {
+			if containsLocalSchemaRef(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range value {
+			if containsLocalSchemaRef(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // normalizeSchema 递归修正规范问题。root 表示该 schema 是函数参数根节点，
 // xAI 要求该节点最终只能接受 JSON object。
 func normalizeSchema(schema map[string]any, root bool) bool {
@@ -71,10 +247,7 @@ func normalizeSchema(schema map[string]any, root bool) bool {
 		schema["required"] = []any{}
 		changed = true
 	}
-
-	for _, value := range schema {
-		changed = normalizeSchemaValue(value) || changed
-	}
+	changed = normalizeChildSchemas(schema) || changed
 	if root {
 		changed = normalizeRootObjectSchema(schema, schema) || changed
 	}
@@ -84,44 +257,112 @@ func normalizeSchema(schema map[string]any, root bool) bool {
 	return changed
 }
 
+func normalizeChildSchemas(schema map[string]any) bool {
+	changed := false
+	for _, key := range []string{"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"} {
+		container, ok := schema[key].(map[string]any)
+		if !ok {
+			continue
+		}
+		for name, rawChild := range container {
+			switch child := rawChild.(type) {
+			case map[string]any:
+				changed = normalizeSchema(child, false) || changed
+			case bool:
+				// JSON Schema 允许 boolean schema。
+			default:
+				// properties 下的 null/数组不是合法 Schema；空 object 是最宽松的安全降级。
+				container[name] = map[string]any{}
+				changed = true
+			}
+		}
+	}
+	for _, key := range []string{"anyOf", "oneOf", "allOf", "prefixItems"} {
+		children, ok := schema[key].([]any)
+		if !ok {
+			continue
+		}
+		for index, rawChild := range children {
+			switch child := rawChild.(type) {
+			case map[string]any:
+				changed = normalizeSchema(child, false) || changed
+			case bool:
+			default:
+				children[index] = map[string]any{}
+				changed = true
+			}
+		}
+	}
+	for _, key := range []string{
+		"items", "additionalProperties", "unevaluatedProperties", "contains", "propertyNames",
+		"not", "if", "then", "else",
+	} {
+		rawChild, exists := schema[key]
+		if !exists {
+			continue
+		}
+		switch child := rawChild.(type) {
+		case map[string]any:
+			changed = normalizeSchema(child, false) || changed
+		case []any:
+			for index, rawItem := range child {
+				if item, ok := rawItem.(map[string]any); ok {
+					changed = normalizeSchema(item, false) || changed
+				} else if _, ok := rawItem.(bool); !ok {
+					child[index] = map[string]any{}
+					changed = true
+				}
+			}
+		case bool:
+		default:
+			schema[key] = map[string]any{}
+			changed = true
+		}
+	}
+	return changed
+}
+
 func removeNullRequired(value any) bool {
+	return removeNullRequiredValue(value, false)
+}
+
+func removeNullRequiredValue(value any, namedSchemaContainer bool) bool {
 	changed := false
 	switch value := value.(type) {
 	case map[string]any:
+		if namedSchemaContainer {
+			for _, child := range value {
+				changed = removeNullRequiredValue(child, false) || changed
+			}
+			return changed
+		}
 		if required, exists := value["required"]; exists && required == nil {
 			value["required"] = []any{}
 			changed = true
 		}
-		for _, child := range value {
-			changed = removeNullRequired(child) || changed
+		for key, child := range value {
+			container := key == "properties" || key == "patternProperties" || key == "$defs" ||
+				key == "definitions" || key == "dependentSchemas"
+			changed = removeNullRequiredValue(child, container) || changed
 		}
 	case []any:
 		for _, child := range value {
-			changed = removeNullRequired(child) || changed
+			changed = removeNullRequiredValue(child, false) || changed
 		}
 	}
 	return changed
 }
 
 func ensureObjectRequiredArrays(value any) bool {
-	changed := false
-	switch value := value.(type) {
-	case map[string]any:
-		if schemaAllowsObjectDirectly(value) {
-			if required, exists := value["required"]; !exists || required == nil {
-				value["required"] = []any{}
-				changed = true
-			}
-		}
-		for _, child := range value {
-			changed = ensureObjectRequiredArrays(child) || changed
-		}
-	case []any:
-		for _, child := range value {
-			changed = ensureObjectRequiredArrays(child) || changed
-		}
+	schema, ok := value.(map[string]any)
+	if !ok || !schemaAllowsObjectDirectly(schema) {
+		return false
 	}
-	return changed
+	if required, exists := schema["required"]; !exists || required == nil {
+		schema["required"] = []any{}
+		return true
+	}
+	return false
 }
 
 func schemaAllowsObjectDirectly(schema map[string]any) bool {
@@ -139,23 +380,9 @@ func schemaAllowsObjectDirectly(schema map[string]any) bool {
 	return hasProperties
 }
 
-func normalizeSchemaValue(value any) bool {
-	switch value := value.(type) {
-	case map[string]any:
-		return normalizeSchema(value, false)
-	case []any:
-		changed := false
-		for _, item := range value {
-			changed = normalizeSchemaValue(item) || changed
-		}
-		return changed
-	default:
-		return false
-	}
-}
-
 func normalizeRootObjectSchema(schema, root map[string]any) bool {
 	changed := narrowObjectType(schema)
+	changed = mergeRootAllOf(schema, root) || changed
 	rootIsObject := schemaDirectlyRequiresObject(schema)
 
 	for _, unionKey := range []string{"anyOf", "oneOf"} {
@@ -164,70 +391,185 @@ func normalizeRootObjectSchema(schema, root map[string]any) bool {
 			continue
 		}
 
-		// 当根节点已经约束为 object 时，oneOf/anyOf 的无类型分支只是附加条件。
-		// 标准 JSON Schema 会把这些约束与根 type 合并，但 xAI 要求每个分支显式声明 object。
-		if rootIsObject {
-			objectBranches := make([]any, 0, len(rawBranches))
-			for _, rawBranch := range rawBranches {
-				branch, ok := rawBranch.(map[string]any)
-				if !ok {
-					changed = true
-					continue
-				}
-				changed = normalizeRootObjectSchema(branch, root) || changed
-				if schemaExplicitlyRejectsObject(branch) {
-					changed = true
-					continue
-				}
-				if !schemaAllowsObject(branch, root, map[string]bool{}) {
-					branch["type"] = "object"
-					changed = true
-				}
-				objectBranches = append(objectBranches, branch)
-			}
-			if len(objectBranches) > 0 {
-				schema[unionKey] = objectBranches
-			} else {
-				delete(schema, unionKey)
-			}
-			continue
-		}
-
-		// 根节点自身没有 object 约束时，只保留能够确认接受 object 的联合分支。
-		objectBranches := make([]any, 0, len(rawBranches))
+		objectBranches := make([]map[string]any, 0, len(rawBranches))
 		for _, rawBranch := range rawBranches {
 			branch, ok := rawBranch.(map[string]any)
 			if !ok {
+				changed = true
 				continue
 			}
 			changed = normalizeRootObjectSchema(branch, root) || changed
-			if schemaAllowsObject(branch, root, map[string]bool{}) {
-				objectBranches = append(objectBranches, branch)
+			acceptsObject := !schemaExplicitlyRejectsObject(branch)
+			if !rootIsObject {
+				acceptsObject = schemaAllowsObject(branch, root, map[string]bool{})
 			}
+			if !acceptsObject {
+				changed = true
+				continue
+			}
+			if branch["type"] != "object" {
+				branch["type"] = "object"
+				changed = true
+			}
+			objectBranches = append(objectBranches, branch)
 		}
 
-		if len(objectBranches) == 0 {
-			continue
-		}
-		if len(objectBranches) != len(rawBranches) {
-			changed = true
-		}
-		if len(objectBranches) == 1 {
-			delete(schema, unionKey)
-			branch := objectBranches[0].(map[string]any)
-			for key, value := range branch {
-				if _, exists := schema[key]; !exists {
-					schema[key] = value
-				}
-			}
-		} else {
-			schema[unionKey] = objectBranches
-		}
+		delete(schema, unionKey)
 		schema["type"] = "object"
 		rootIsObject = true
+		changed = true
+		if len(objectBranches) == 0 {
+			// 纯标量联合无法保留为工具参数，降级成宽松 object。
+			if _, exists := schema["properties"]; !exists {
+				schema["properties"] = map[string]any{}
+			}
+			schema["additionalProperties"] = true
+			continue
+		}
+		changed = mergeAlternativeObjectBranches(schema, objectBranches) || changed
 	}
 
 	return changed
+}
+
+func mergeRootAllOf(schema, root map[string]any) bool {
+	rawBranches, ok := schema["allOf"].([]any)
+	if !ok || len(rawBranches) == 0 {
+		return false
+	}
+	changed := false
+	required := requiredSet(schema)
+	allAdditionalPropertiesFalse := true
+	retained := 0
+	for _, rawBranch := range rawBranches {
+		branch, ok := rawBranch.(map[string]any)
+		if !ok {
+			continue
+		}
+		changed = normalizeRootObjectSchema(branch, root) || changed
+		if schemaExplicitlyRejectsObject(branch) {
+			continue
+		}
+		retained++
+		changed = mergeObjectProperties(schema, branch, "allOf") || changed
+		for name := range requiredSet(branch) {
+			required[name] = true
+		}
+		if branch["additionalProperties"] != false {
+			allAdditionalPropertiesFalse = false
+		}
+	}
+	delete(schema, "allOf")
+	schema["type"] = "object"
+	setRequired(schema, required)
+	if retained > 0 && allAdditionalPropertiesFalse {
+		if _, exists := schema["additionalProperties"]; !exists {
+			schema["additionalProperties"] = false
+		}
+	}
+	return true
+}
+
+func mergeAlternativeObjectBranches(schema map[string]any, branches []map[string]any) bool {
+	changed := false
+	var commonRequired map[string]bool
+	allAdditionalPropertiesFalse := true
+	for _, branch := range branches {
+		changed = mergeObjectProperties(schema, branch, "anyOf") || changed
+		branchRequired := requiredSet(branch)
+		if commonRequired == nil {
+			commonRequired = branchRequired
+		} else {
+			for name := range commonRequired {
+				if !branchRequired[name] {
+					delete(commonRequired, name)
+				}
+			}
+		}
+		if branch["additionalProperties"] != false {
+			allAdditionalPropertiesFalse = false
+		}
+	}
+	required := requiredSet(schema)
+	for name := range commonRequired {
+		required[name] = true
+	}
+	setRequired(schema, required)
+	if allAdditionalPropertiesFalse {
+		if _, exists := schema["additionalProperties"]; !exists {
+			schema["additionalProperties"] = false
+			changed = true
+		}
+	}
+	return changed
+}
+
+func mergeObjectProperties(target, source map[string]any, conflictKeyword string) bool {
+	sourceProperties, ok := source["properties"].(map[string]any)
+	if !ok {
+		return false
+	}
+	targetProperties, _ := target["properties"].(map[string]any)
+	if targetProperties == nil {
+		targetProperties = make(map[string]any)
+		target["properties"] = targetProperties
+	}
+	changed := false
+	for name, incoming := range sourceProperties {
+		existing, exists := targetProperties[name]
+		if !exists {
+			targetProperties[name] = cloneSchemaValue(incoming)
+			changed = true
+			continue
+		}
+		if reflect.DeepEqual(existing, incoming) {
+			continue
+		}
+		targetProperties[name] = mergePropertyAlternatives(existing, incoming, conflictKeyword)
+		changed = true
+	}
+	return changed
+}
+
+func mergePropertyAlternatives(existing, incoming any, keyword string) map[string]any {
+	branches := []any{cloneSchemaValue(existing)}
+	if object, ok := existing.(map[string]any); ok {
+		if values, ok := object[keyword].([]any); ok && len(object) == 1 {
+			branches = append([]any(nil), values...)
+		}
+	}
+	for _, branch := range branches {
+		if reflect.DeepEqual(branch, incoming) {
+			return map[string]any{keyword: branches}
+		}
+	}
+	branches = append(branches, cloneSchemaValue(incoming))
+	return map[string]any{keyword: branches}
+}
+
+func requiredSet(schema map[string]any) map[string]bool {
+	set := make(map[string]bool)
+	if required, ok := schema["required"].([]any); ok {
+		for _, rawName := range required {
+			if name, ok := rawName.(string); ok {
+				set[name] = true
+			}
+		}
+	}
+	return set
+}
+
+func setRequired(schema map[string]any, required map[string]bool) {
+	names := make([]string, 0, len(required))
+	for name := range required {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	values := make([]any, len(names))
+	for index, name := range names {
+		values[index] = name
+	}
+	schema["required"] = values
 }
 
 func schemaDirectlyRequiresObject(schema map[string]any) bool {
@@ -324,7 +666,6 @@ func toolSchemaSummary(body []byte) string {
 		if !ok {
 			continue
 		}
-		name, _ := tool["name"].(string)
 		var schema map[string]any
 		var format string
 		if value, ok := tool["parameters"].(map[string]any); ok {
@@ -332,9 +673,6 @@ func toolSchemaSummary(body []byte) string {
 		} else if value, ok := tool["input_schema"].(map[string]any); ok {
 			schema, format = value, "input_schema"
 		} else if function, ok := tool["function"].(map[string]any); ok {
-			if name == "" {
-				name, _ = function["name"].(string)
-			}
 			if value, ok := function["parameters"].(map[string]any); ok {
 				schema, format = value, "function.parameters"
 			}
@@ -343,7 +681,6 @@ func toolSchemaSummary(body []byte) string {
 			continue
 		}
 		summaries = append(summaries, map[string]any{
-			"name":   name,
 			"format": format,
 			"root":   summarizeSchemaStructure(schema, 0),
 		})
@@ -367,19 +704,22 @@ func summarizeSchemaStructure(schema map[string]any, depth int) map[string]any {
 		return map[string]any{"truncated": true}
 	}
 	out := map[string]any{}
-	for _, key := range []string{"type", "$ref", "required", "additionalProperties"} {
-		if value, exists := schema[key]; exists {
-			switch value := value.(type) {
-			case map[string]any:
-				out[key] = summarizeSchemaStructure(value, depth+1)
-			case []any:
-				if key == "required" || key == "type" {
-					out[key] = value
-				}
-			case string, bool, nil:
-				out[key] = value
-			}
+	if schemaType, exists := schema["type"]; exists {
+		switch schemaType := schemaType.(type) {
+		case string:
+			out["type"] = schemaType
+		case []any:
+			out["type_count"] = len(schemaType)
 		}
+	}
+	if _, exists := schema["$ref"]; exists {
+		out["has_ref"] = true
+	}
+	if required, ok := schema["required"].([]any); ok {
+		out["required_count"] = len(required)
+	}
+	if additional, ok := schema["additionalProperties"].(bool); ok {
+		out["additionalProperties"] = additional
 	}
 	for _, key := range []string{"anyOf", "oneOf", "allOf"} {
 		if branches, ok := schema[key].([]any); ok {
@@ -395,12 +735,7 @@ func summarizeSchemaStructure(schema map[string]any, depth int) map[string]any {
 		}
 	}
 	if properties, ok := schema["properties"].(map[string]any); ok {
-		names := make([]string, 0, len(properties))
-		for name := range properties {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		out["property_names"] = names
+		out["property_count"] = len(properties)
 	}
 	keys := make([]string, 0, len(schema))
 	for key := range schema {

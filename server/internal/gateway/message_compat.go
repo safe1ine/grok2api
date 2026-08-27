@@ -5,6 +5,79 @@ import "encoding/json"
 // normalizeAnthropicMessageRoles 修正 OpenAI 风格客户端误发到 Anthropic
 // /messages 端点的消息角色。Anthropic messages 只接受 user/assistant，
 // system/developer 指令必须位于请求顶层 system 字段。
+// normalizeAnthropicToolChoice 将 OpenAI 风格的工具选择转换为 Anthropic Messages 格式。
+// Anthropic 没有 none：该语义表示禁用工具，因此必须同时移除 tools。
+func normalizeAnthropicToolChoice(body []byte) ([]byte, bool) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body, false
+	}
+	choice, exists := payload["tool_choice"]
+	if !exists {
+		return body, false
+	}
+
+	var choiceType string
+	var choiceObject map[string]any
+	switch choice := choice.(type) {
+	case string:
+		choiceType = choice
+	case map[string]any:
+		choiceObject = choice
+		choiceType, _ = choice["type"].(string)
+	default:
+		return body, false
+	}
+
+	changed := false
+	switch choiceType {
+	case "none":
+		delete(payload, "tool_choice")
+		delete(payload, "tools")
+		changed = true
+	case "required":
+		normalizedChoice := map[string]any{"type": "any"}
+		if choiceObject != nil {
+			if disable, exists := choiceObject["disable_parallel_tool_use"]; exists {
+				normalizedChoice["disable_parallel_tool_use"] = disable
+			}
+		}
+		payload["tool_choice"] = normalizedChoice
+		changed = true
+	case "function":
+		name := ""
+		if choiceObject != nil {
+			name, _ = choiceObject["name"].(string)
+			if name == "" {
+				if function, ok := choiceObject["function"].(map[string]any); ok {
+					name, _ = function["name"].(string)
+				}
+			}
+		}
+		if name != "" {
+			normalizedChoice := map[string]any{"type": "tool", "name": name}
+			if disable, exists := choiceObject["disable_parallel_tool_use"]; exists {
+				normalizedChoice["disable_parallel_tool_use"] = disable
+			}
+			payload["tool_choice"] = normalizedChoice
+			changed = true
+		}
+	case "auto", "any":
+		if choiceObject == nil {
+			payload["tool_choice"] = map[string]any{"type": choiceType}
+			changed = true
+		}
+	}
+	if !changed {
+		return body, false
+	}
+	normalized, err := json.Marshal(payload)
+	if err != nil {
+		return body, false
+	}
+	return normalized, true
+}
+
 func normalizeAnthropicMessageRoles(body []byte) ([]byte, bool) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {

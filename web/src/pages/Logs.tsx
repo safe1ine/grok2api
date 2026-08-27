@@ -90,7 +90,7 @@ const defaultColumnVisibility: ColumnVisibility = {
   endpoint: false,
   status: true,
   input: true,
-  cached: true,
+  cached: false,
   cacheHit: true,
   output: true,
   ttft: true,
@@ -98,13 +98,22 @@ const defaultColumnVisibility: ColumnVisibility = {
   stream: true,
 }
 
-const columnStorageKey = 'grok2api.logs.visible-columns'
+const legacyColumnStorageKey = 'grok2api.logs.visible-columns'
+const columnStorageKey = 'grok2api.logs.visible-columns.v2'
 
 function loadColumnVisibility(): ColumnVisibility {
   try {
-    const stored = JSON.parse(window.localStorage.getItem(columnStorageKey) || '{}') as Partial<ColumnVisibility>
+    const current = window.localStorage.getItem(columnStorageKey)
+    const stored = JSON.parse(current || window.localStorage.getItem(legacyColumnStorageKey) || '{}') as Partial<ColumnVisibility>
     return Object.fromEntries(
-      columnOptions.map(({ key }) => [key, typeof stored[key] === 'boolean' ? stored[key] : defaultColumnVisibility[key]]),
+      columnOptions.map(({ key }) => [
+        key,
+        current === null && key === 'cached'
+          ? false
+          : typeof stored[key] === 'boolean'
+            ? stored[key]
+            : defaultColumnVisibility[key],
+      ]),
     ) as ColumnVisibility
   } catch {
     return defaultColumnVisibility
@@ -247,17 +256,16 @@ export default function Logs() {
                   )}
                   {visibleColumns.status && (
                     <td>
-                      <span
-                        className={`badge badge-sm ${
-                          l.status >= 200 && l.status < 300
-                            ? 'badge-success'
-                            : l.status >= 500
-                              ? 'badge-error'
-                              : 'badge-warning'
-                        }`}
-                      >
-                        {l.status}
-                      </span>
+                      {l.status >= 200 && l.status < 300 ? (
+                        <span className="badge badge-success badge-sm">成功</span>
+                      ) : (
+                        <div
+                          className="tooltip tooltip-left"
+                          data-tip={l.error_reason || '历史记录或响应中未包含可提取的错误原因'}
+                        >
+                          <span className="badge badge-error badge-sm">错误</span>
+                        </div>
+                      )}
                     </td>
                   )}
                   {visibleColumns.input && (
@@ -288,8 +296,8 @@ export default function Logs() {
                   )}
                   {visibleColumns.stream && (
                     <td className="min-w-20">
-                      <span className={`badge badge-sm min-w-16 justify-center whitespace-nowrap ${l.stream ? 'badge-info' : 'badge-ghost'}`}>
-                        {l.stream ? '流式' : '非流式'}
+                      <span className={`badge badge-sm whitespace-nowrap ${l.stream ? 'badge-info' : 'badge-ghost'}`}>
+                        {l.stream ? '流式' : '非流'}
                       </span>
                     </td>
                   )}

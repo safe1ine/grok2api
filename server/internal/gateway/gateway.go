@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -21,6 +20,8 @@ import (
 	"grok2api/server/internal/pool"
 	"grok2api/server/internal/store"
 )
+
+const upstreamCompletionTimeout = 30 * time.Minute
 
 type Gateway struct {
 	cfg   *config.Config
@@ -81,6 +82,14 @@ func parseModel(body []byte) string {
 	return m.Model
 }
 
+func accountAttemptLimit(p *pool.Pool) int {
+	count := p.Len()
+	if count < 1 {
+		return 1
+	}
+	return min(count, 6)
+}
+
 func parseRetryAfter(resp *http.Response) time.Duration {
 	if s := resp.Header.Get("Retry-After"); s != "" {
 		if n, err := strconv.Atoi(s); err == nil && n > 0 {
@@ -97,142 +106,212 @@ func parseRetryAfter(resp *http.Response) time.Duration {
 
 // ---------- 通用透传 ----------
 
+func withUpstreamCompletionContext(r *http.Request) (*http.Request, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), upstreamCompletionTimeout)
+	return r.WithContext(ctx), cancel
+}
+
 func (g *Gateway) Proxy(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	body, _ := io.ReadAll(r.Body)
+	if r.URL.Path == "/v1/chat/completions" {
+		body, _ = ensureChatStreamUsage(body)
+	}
+	r, cancelUpstream := withUpstreamCompletionContext(r)
+	defer cancelUpstream()
 	roleChanged := false
+	anthropicToolChoiceChanged := false
 	if r.URL.Path == "/v1/messages" {
 		body, roleChanged = normalizeAnthropicMessageRoles(body)
+		body, anthropicToolChoiceChanged = normalizeAnthropicToolChoice(body)
 	}
 	body, namespaceMappings, namespaceChanged := flattenNamespaceTools(body)
 	body, schemaChanged := normalizeToolSchemas(body)
-	compatibilityChanged := roleChanged || namespaceChanged || schemaChanged
+	body, toolChoiceChanged, invalidToolChoice := normalizeToolChoiceWithoutTools(body)
+	compatibilityChanged := roleChanged || anthropicToolChoiceChanged || namespaceChanged || schemaChanged || toolChoiceChanged
 	model := parseModel(body)
 	metrics := responseMetrics{Stream: parseStreamRequest(body)}
 	upstreamPath := r.URL.Path
 	if r.URL.RawQuery != "" {
 		upstreamPath += "?" + r.URL.RawQuery
 	}
+	if invalidToolChoice {
+		const message = "请求设置了 required 或指定函数的 tool_choice，但没有提供可用的 tools"
+		g.writeError(w, http.StatusBadRequest, message)
+		metrics.ErrorReason = "工具选择与工具定义不匹配"
+		g.log(r, nil, model, upstreamPath, http.StatusBadRequest, start, metrics)
+		return
+	}
 
 	var acct *pool.Account
 	finalStatus := 0
-	saw401 := map[int64]int{}
+	lastFailureReason := ""
+	triedAccounts := map[int64]struct{}{}
 	appliedStateFallbacks := map[stateCompatibilityIssue]bool{}
 	appliedUnsupportedArguments := map[string]bool{}
+	appliedRootSchemaFallback := false
+	compatibilityRetries := 0
+	maxAccountAttempts := accountAttemptLimit(g.pool)
 
-	for attempt := 0; attempt < 6; attempt++ {
-		a, err := g.pool.Acquire()
+accountsLoop:
+	for accountAttempt := 0; accountAttempt < maxAccountAttempts; accountAttempt++ {
+		a, err := g.pool.AcquireExcluding(triedAccounts)
 		if err != nil {
-			if errors.Is(err, pool.ErrAllCoolingDown) {
-				select {
-				case <-time.After(500 * time.Millisecond):
-					continue
-				case <-r.Context().Done():
-					return
-				}
-			}
 			break
 		}
+		triedAccounts[a.ID] = struct{}{}
 		acct = a
 
 		token, err := g.pool.Token(r.Context(), a)
 		if err != nil {
 			if errors.Is(err, oauth.ErrInvalidGrant) {
+				lastFailureReason = "账号需要重新授权"
 				g.pool.MarkNeedRelogin(r.Context(), a)
 			} else {
-				// 临时错误（网络等）：短冷却后重试，不误杀账号
+				lastFailureReason = "账号 Token 刷新失败"
 				g.pool.Release(a, time.Now().Add(30*time.Second))
 			}
 			continue
 		}
 
-		resp, err := g.doRequest(r, token, body, upstreamPath)
-		if err != nil {
-			g.pool.Release(a, time.Now())
-			break
-		}
-		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity {
-			errorBody, readErr := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			resp.Body = io.NopCloser(bytes.NewReader(errorBody))
-			if readErr == nil {
-				issue := classifyStateCompatibilityError(errorBody)
-				if issue != "" && !appliedStateFallbacks[issue] {
-					before := stateCompatibilitySummary(body)
-					if fallbackBody, changed := applyStateCompatibilityFallback(body, issue); changed {
-						if encoded, err := json.Marshal(before); err == nil {
-							log.Printf("上游状态兼容降级: path=%s issue=%s account=%d state=%s", upstreamPath, issue, a.ID, encoded)
-						}
-						body = fallbackBody
-						compatibilityChanged = true
-						appliedStateFallbacks[issue] = true
-						g.pool.Release(a, time.Now())
-						continue
-					}
-				}
-				argument := unsupportedArgument(errorBody)
-				if argument != "" && !appliedUnsupportedArguments[argument] {
-					if fallbackBody, changed := removeUnsupportedArgument(body, argument); changed {
-						log.Printf("上游参数兼容降级: path=%s argument=%s account=%d", upstreamPath, argument, a.ID)
-						body = fallbackBody
-						compatibilityChanged = true
-						appliedUnsupportedArguments[argument] = true
-						g.pool.Release(a, time.Now())
-						continue
-					}
-				}
-
-				lowerError := strings.ToLower(string(errorBody))
-				if strings.Contains(lowerError, "schema validation") {
-					if summary := toolSchemaSummary(body); summary != "" {
-						log.Printf("上游 Schema 失败: path=%s normalized=%t schema=%s", upstreamPath, compatibilityChanged, summary)
-					}
-				}
-				if strings.Contains(lowerError, "invalid message role") {
-					if summary := messageRoleSummary(body); summary != nil {
-						if encoded, err := json.Marshal(summary); err == nil {
-							log.Printf("上游 Message Roles 失败: path=%s normalized=%t roles=%s", upstreamPath, compatibilityChanged, encoded)
-						}
-					}
-				}
-			}
-		}
-
-		if resp.StatusCode == http.StatusUnauthorized {
-			resp.Body.Close()
-			a.Invalidate()
-			saw401[a.ID]++
-			if saw401[a.ID] >= 2 {
-				// 刷新后仍 401：账号 API 权限可能已失效
-				g.pool.MarkNeedRelogin(r.Context(), a)
-			} else {
+		refreshedAfter401 := false
+		for {
+			resp, err := g.doRequest(r, token, body, upstreamPath)
+			if err != nil {
+				lastFailureReason = "连接上游失败"
 				g.pool.Release(a, time.Now())
+				if r.Context().Err() != nil {
+					break accountsLoop
+				}
+				continue accountsLoop
 			}
-			continue
-		}
-		if resp.StatusCode == http.StatusTooManyRequests {
-			resp.Body.Close()
-			g.pool.Release(a, time.Now().Add(parseRetryAfter(resp)))
-			continue
-		}
+			var errorBody []byte
+			var errorBodyReadErr error
+			if resp.StatusCode >= 400 {
+				errorBody, errorBodyReadErr = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+				resp.Body.Close()
+				resp.Body = io.NopCloser(bytes.NewReader(errorBody))
+				if errorBodyReadErr == nil && isAccountQuotaExhaustedResponse(errorBody) {
+					lastFailureReason = "账号额度已耗尽"
+					resp.Body.Close()
+					g.pool.ReleaseQuotaExhausted(a)
+					g.pool.RefreshBillingAsync(a.ID)
+					continue accountsLoop
+				}
+			}
+			if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity {
+				if errorBodyReadErr == nil {
+					if compatibilityRetries < 4 && !appliedRootSchemaFallback && isToolRootSchemaErrorResponse(errorBody) {
+						if fallbackBody, changed := relaxToolParameterRoots(body); changed {
+							log.Printf("上游工具根 Schema 降级: path=%s account=%d", upstreamPath, a.ID)
+							body = fallbackBody
+							compatibilityChanged = true
+							appliedRootSchemaFallback = true
+							compatibilityRetries++
+							continue
+						}
+					}
+					issue := classifyStateCompatibilityError(errorBody)
+					if compatibilityRetries < 4 && issue != "" && !appliedStateFallbacks[issue] {
+						before := stateCompatibilitySummary(body)
+						if fallbackBody, changed := applyStateCompatibilityFallback(body, issue); changed {
+							if encoded, err := json.Marshal(before); err == nil {
+								log.Printf("上游状态兼容降级: path=%s issue=%s account=%d state=%s", upstreamPath, issue, a.ID, encoded)
+							}
+							body = fallbackBody
+							compatibilityChanged = true
+							appliedStateFallbacks[issue] = true
+							compatibilityRetries++
+							continue
+						}
+					}
+					argument := unsupportedArgument(errorBody)
+					if compatibilityRetries < 4 && argument != "" && !appliedUnsupportedArguments[argument] {
+						if fallbackBody, changed := removeUnsupportedArgument(body, argument); changed {
+							log.Printf("上游参数兼容降级: path=%s argument=%s account=%d", upstreamPath, argument, a.ID)
+							body = fallbackBody
+							compatibilityChanged = true
+							appliedUnsupportedArguments[argument] = true
+							compatibilityRetries++
+							continue
+						}
+					}
 
-		copyHeaders(w.Header(), resp.Header, excludeRespHeaders)
-		w.WriteHeader(resp.StatusCode)
-		finalStatus = resp.StatusCode
-		responseStats := streamCopyWithCompatibility(
-			w, resp.Body, resp.Header.Get("Content-Type"), namespaceMappings, start,
-			streamCompatibilityOptions{fillAnthropicIndexes: r.URL.Path == "/v1/messages"},
-		)
-		responseStats.Stream = metrics.Stream
-		metrics = responseStats
-		resp.Body.Close()
-		g.pool.Release(a, time.Now())
-		break
+					lowerError := strings.ToLower(string(errorBody))
+					if strings.Contains(lowerError, "schema validation") {
+						if summary := toolSchemaSummary(body); summary != "" {
+							log.Printf("上游 Schema 失败: path=%s normalized=%t schema=%s", upstreamPath, compatibilityChanged, summary)
+						}
+					}
+					if strings.Contains(lowerError, "invalid message role") {
+						if summary := messageRoleSummary(body); summary != nil {
+							if encoded, err := json.Marshal(summary); err == nil {
+								log.Printf("上游 Message Roles 失败: path=%s normalized=%t roles=%s", upstreamPath, compatibilityChanged, encoded)
+							}
+						}
+					}
+				}
+			}
+
+			if resp.StatusCode == http.StatusUnauthorized {
+				if reason := classifySafeResponseErrorData(errorBody); reason != "" {
+					lastFailureReason = reason
+				}
+				resp.Body.Close()
+				if refreshedAfter401 {
+					if lastFailureReason == "" {
+						lastFailureReason = "上游账号认证失败"
+					}
+					g.pool.MarkNeedRelogin(r.Context(), a)
+					continue accountsLoop
+				}
+				a.Invalidate()
+				token, err = g.pool.Token(r.Context(), a)
+				if err != nil {
+					if errors.Is(err, oauth.ErrInvalidGrant) {
+						lastFailureReason = "账号需要重新授权"
+						g.pool.MarkNeedRelogin(r.Context(), a)
+					} else {
+						lastFailureReason = "账号 Token 刷新失败"
+						g.pool.Release(a, time.Now().Add(30*time.Second))
+					}
+					continue accountsLoop
+				}
+				refreshedAfter401 = true
+				continue
+			}
+			if resp.StatusCode == http.StatusTooManyRequests {
+				if reason := classifySafeResponseErrorData(errorBody); reason != "" {
+					lastFailureReason = reason
+				}
+				resp.Body.Close()
+				g.pool.Release(a, time.Now().Add(parseRetryAfter(resp)))
+				g.pool.RefreshBillingAsync(a.ID)
+				continue accountsLoop
+			}
+
+			copyHeaders(w.Header(), resp.Header, excludeRespHeaders)
+			w.WriteHeader(resp.StatusCode)
+			finalStatus = resp.StatusCode
+			responseStats := streamCopyWithCompatibility(
+				w, resp.Body, resp.Header.Get("Content-Type"), namespaceMappings, start,
+				streamCompatibilityOptions{fillAnthropicIndexes: r.URL.Path == "/v1/messages"},
+			)
+			responseStats.Stream = metrics.Stream
+			metrics = responseStats
+			resp.Body.Close()
+			g.pool.Release(a, time.Now())
+			break accountsLoop
+		}
 	}
 
 	if finalStatus == 0 {
 		finalStatus = http.StatusServiceUnavailable
-		g.writeError(w, finalStatus, "所有账号暂不可用或均在冷却中")
+		if lastFailureReason == "" {
+			lastFailureReason = "所有账号暂不可用或均在冷却、额度耗尽状态"
+		}
+		metrics.ErrorReason = lastFailureReason
+		g.writeError(w, finalStatus, "所有账号暂不可用或均在冷却、额度耗尽状态")
 	}
 	g.log(r, acct, model, upstreamPath, finalStatus, start, metrics)
 }
@@ -385,8 +464,10 @@ func (g *Gateway) HandleTTS(w http.ResponseWriter, r *http.Request) {
 	if resp.StatusCode != http.StatusOK {
 		copyHeaders(w.Header(), resp.Header, excludeRespHeaders)
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
-		g.log(r, acct, in.Model, "/v1/tts", resp.StatusCode, start, responseMetrics{})
+		metrics := streamCopyWithCompatibility(
+			w, resp.Body, resp.Header.Get("Content-Type"), nil, start, streamCompatibilityOptions{},
+		)
+		g.log(r, acct, in.Model, "/v1/tts", resp.StatusCode, start, metrics)
 		return
 	}
 
@@ -426,39 +507,93 @@ func (g *Gateway) HandleSTT(w http.ResponseWriter, r *http.Request) {
 
 	copyHeaders(w.Header(), resp.Header, excludeRespHeaders)
 	w.WriteHeader(resp.StatusCode)
-	g.streamCopy(w, resp.Body)
-	g.log(r, acct, "stt", "/v1/stt", resp.StatusCode, start, responseMetrics{})
+	metrics := streamCopyWithCompatibility(
+		w, resp.Body, resp.Header.Get("Content-Type"), nil, start, streamCompatibilityOptions{},
+	)
+	g.log(r, acct, "stt", "/v1/stt", resp.StatusCode, start, metrics)
 }
 
-// simpleUpstream 单次上游请求（不重试）。成功时由调用方 Release。
+// simpleUpstream 用于 TTS/STT；401 刷新一次，429 或账号失效时切换到其他账号。
+// 成功返回时由调用方 Release。
 func (g *Gateway) simpleUpstream(r *http.Request, method, path string, body []byte) (*http.Response, *pool.Account, error) {
-	a, err := g.pool.Acquire()
-	if err != nil {
-		return nil, nil, err
-	}
-	token, err := g.pool.Token(r.Context(), a)
-	if err != nil {
-		if errors.Is(err, oauth.ErrInvalidGrant) {
-			g.pool.MarkNeedRelogin(r.Context(), a)
-		} else {
-			g.pool.Release(a, time.Now().Add(30*time.Second))
-		}
-		return nil, nil, fmt.Errorf("账号 token 刷新失败")
-	}
-	req, err := http.NewRequestWithContext(r.Context(), method, g.cfg.XAIAPIBase+path, bytes.NewReader(body))
-	if err != nil {
-		g.pool.Release(a, time.Now())
-		return nil, nil, err
-	}
-	copyHeaders(req.Header, r.Header, excludeReqHeaders)
-	req.Header.Set("Authorization", "Bearer "+token)
+	triedAccounts := map[int64]struct{}{}
+	maxAccountAttempts := accountAttemptLimit(g.pool)
 
-	resp, err := g.http.Do(req)
-	if err != nil {
-		g.pool.Release(a, time.Now())
-		return nil, nil, err
+accountsLoop:
+	for accountAttempt := 0; accountAttempt < maxAccountAttempts; accountAttempt++ {
+		a, err := g.pool.AcquireExcluding(triedAccounts)
+		if err != nil {
+			break
+		}
+		triedAccounts[a.ID] = struct{}{}
+		token, err := g.pool.Token(r.Context(), a)
+		if err != nil {
+			if errors.Is(err, oauth.ErrInvalidGrant) {
+				g.pool.MarkNeedRelogin(r.Context(), a)
+			} else {
+				g.pool.Release(a, time.Now().Add(30*time.Second))
+			}
+			continue
+		}
+
+		refreshedAfter401 := false
+		for {
+			req, err := http.NewRequestWithContext(r.Context(), method, g.cfg.XAIAPIBase+path, bytes.NewReader(body))
+			if err != nil {
+				g.pool.Release(a, time.Now())
+				return nil, nil, err
+			}
+			copyHeaders(req.Header, r.Header, excludeReqHeaders)
+			req.Header.Set("Authorization", "Bearer "+token)
+
+			resp, err := g.http.Do(req)
+			if err != nil {
+				g.pool.Release(a, time.Now())
+				if r.Context().Err() != nil {
+					return nil, nil, err
+				}
+				continue accountsLoop
+			}
+			if resp.StatusCode >= 400 {
+				errorBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+				resp.Body.Close()
+				resp.Body = io.NopCloser(bytes.NewReader(errorBody))
+				if readErr == nil && isAccountQuotaExhaustedResponse(errorBody) {
+					resp.Body.Close()
+					g.pool.ReleaseQuotaExhausted(a)
+					g.pool.RefreshBillingAsync(a.ID)
+					continue accountsLoop
+				}
+			}
+			if resp.StatusCode == http.StatusUnauthorized {
+				resp.Body.Close()
+				if refreshedAfter401 {
+					g.pool.MarkNeedRelogin(r.Context(), a)
+					continue accountsLoop
+				}
+				a.Invalidate()
+				token, err = g.pool.Token(r.Context(), a)
+				if err != nil {
+					if errors.Is(err, oauth.ErrInvalidGrant) {
+						g.pool.MarkNeedRelogin(r.Context(), a)
+					} else {
+						g.pool.Release(a, time.Now().Add(30*time.Second))
+					}
+					continue accountsLoop
+				}
+				refreshedAfter401 = true
+				continue
+			}
+			if resp.StatusCode == http.StatusTooManyRequests {
+				resp.Body.Close()
+				g.pool.Release(a, time.Now().Add(parseRetryAfter(resp)))
+				g.pool.RefreshBillingAsync(a.ID)
+				continue accountsLoop
+			}
+			return resp, a, nil
+		}
 	}
-	return resp, a, nil
+	return nil, nil, errors.New("所有账号暂不可用或均在冷却、额度耗尽状态")
 }
 
 // ---------- 工具 ----------
@@ -477,8 +612,20 @@ func (g *Gateway) log(
 	start time.Time,
 	metrics responseMetrics,
 ) {
-	if status == 0 {
+	if status == 0 || g.store == nil {
 		return
+	}
+	if status >= 200 && status < 300 && metrics.Stream &&
+		(metrics.DownstreamDisconnected || metrics.UpstreamReadError || !metrics.UsageSeen) {
+		accountID := int64(0)
+		if acct != nil {
+			accountID = acct.ID
+		}
+		log.Printf(
+			"流式调用终止诊断: endpoint=%s account=%d usage_seen=%t completed=%t downstream_disconnected=%t upstream_read_error=%t",
+			endpoint, accountID, metrics.UsageSeen, metrics.StreamCompleted,
+			metrics.DownstreamDisconnected, metrics.UpstreamReadError,
+		)
 	}
 	totalLatencyMs := int(time.Since(start).Milliseconds())
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -493,12 +640,17 @@ func (g *Gateway) log(
 		accountID = &id
 		g.store.TouchLastUsed(ctx, id)
 	}
+	errorReason := ""
+	if status < 200 || status >= 300 {
+		errorReason = metrics.ErrorReason
+	}
 	l := store.CallLog{
 		KeyID:            keyID,
 		AccountID:        accountID,
 		Model:            model,
 		Endpoint:         endpoint,
 		Status:           status,
+		ErrorReason:      errorReason,
 		PromptTokens:     metrics.InputTokens,
 		CachedTokens:     metrics.CachedInputTokens,
 		CompletionTokens: metrics.OutputTokens,

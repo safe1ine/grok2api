@@ -117,6 +117,8 @@ function MetricChart({
 
 export default function Dashboard() {
   const [rangeMinutes, setRangeMinutes] = useState(360)
+  const [selectedModel, setSelectedModel] = useState('')
+  const [selectedKeyID, setSelectedKeyID] = useState('')
   const [data, setData] = useState<DashboardResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -124,14 +126,17 @@ export default function Dashboard() {
   const load = useCallback(async () => {
     setError('')
     try {
-      const result = await api<DashboardResponse>(`/api/dashboard?minutes=${rangeMinutes}`)
+      const params = new URLSearchParams({ minutes: String(rangeMinutes) })
+      if (selectedModel) params.set('model', selectedModel)
+      if (selectedKeyID) params.set('key_id', selectedKeyID)
+      const result = await api<DashboardResponse>(`/api/dashboard?${params.toString()}`)
       setData(result)
     } catch (err) {
       setError(err instanceof Error ? err.message : '加载仪表盘失败')
     } finally {
       setLoading(false)
     }
-  }, [rangeMinutes])
+  }, [rangeMinutes, selectedKeyID, selectedModel])
 
   useEffect(() => {
     setLoading(true)
@@ -151,6 +156,29 @@ export default function Dashboard() {
         <h1 className="text-2xl font-semibold tracking-tight">仪表盘</h1>
         <div className="flex flex-wrap gap-2 self-start sm:self-auto">
           <select
+            aria-label="模型"
+            className="select select-bordered select-sm max-w-52"
+            value={selectedModel}
+            onChange={(event) => setSelectedModel(event.target.value)}
+          >
+            <option value="">全部模型</option>
+            {(data?.models ?? []).map((model) => (
+              <option key={model} value={model}>{model}</option>
+            ))}
+          </select>
+          <select
+            aria-label="Key"
+            className="select select-bordered select-sm max-w-52"
+            value={selectedKeyID}
+            onChange={(event) => setSelectedKeyID(event.target.value)}
+          >
+            <option value="">全部 Key</option>
+            {(data?.keys ?? []).map((key) => (
+              <option key={key.id} value={key.id}>{key.name} · {key.prefix}…</option>
+            ))}
+          </select>
+          <select
+            aria-label="时间范围"
             className="select select-bordered select-sm"
             value={rangeMinutes}
             onChange={(event) => setRangeMinutes(Number(event.target.value))}

@@ -36,8 +36,8 @@ func TestFlattenNamespaceToolsAndRewriteRequestHistory(t *testing.T) {
 
 	payload := decodeNamespacePayload(t, normalized)
 	tools := payload["tools"].([]any)
-	if len(tools) != 2 {
-		t.Fatalf("tools length = %d, want 2", len(tools))
+	if len(tools) != 3 {
+		t.Fatalf("tools length = %d, want 3", len(tools))
 	}
 	flat := tools[1].(map[string]any)
 	if flat["type"] != "function" || flat["name"] != "crm__get_customer" || flat["strict"] != true {
@@ -50,6 +50,11 @@ func TestFlattenNamespaceToolsAndRewriteRequestHistory(t *testing.T) {
 		if _, exists := flat[forbidden]; exists {
 			t.Fatalf("flat tool retained unsupported field %q", forbidden)
 		}
+	}
+	custom := tools[2].(map[string]any)
+	customMapping, ok := mappings["crm__query"]
+	if custom["type"] != "function" || !ok || !customMapping.Custom {
+		t.Fatalf("custom tool=%#v mapping=%#v", custom, customMapping)
 	}
 
 	call := payload["input"].([]any)[0].(map[string]any)
@@ -65,6 +70,82 @@ func TestFlattenNamespaceToolsAndRewriteRequestHistory(t *testing.T) {
 	}
 	if _, exists := choice["namespace"]; exists {
 		t.Fatal("tool choice retained namespace")
+	}
+}
+
+func TestConvertCustomToolRequestAndResponse(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"input":[
+			{"type":"custom_tool_call","name":"patch","call_id":"call_1","input":"raw patch"},
+			{"type":"custom_tool_call_output","call_id":"call_1","output":"ok"}
+		],
+		"tool_choice":{"type":"custom","name":"patch"},
+		"tools":[{"type":"custom","name":"patch","description":"Apply patch","format":{"type":"text"}}]
+	}`)
+	normalized, mappings, changed := flattenNamespaceTools(body)
+	if !changed {
+		t.Fatal("expected custom tool conversion")
+	}
+	mapping, ok := mappings["patch"]
+	if !ok || !mapping.Custom || mapping.Name != "patch" {
+		t.Fatalf("mapping = %#v", mapping)
+	}
+	payload := decodeNamespacePayload(t, normalized)
+	tool := payload["tools"].([]any)[0].(map[string]any)
+	if tool["type"] != "function" || tool["description"] != "Apply patch" {
+		t.Fatalf("converted tool = %#v", tool)
+	}
+	parameters := tool["parameters"].(map[string]any)
+	if parameters["type"] != "object" || len(parameters["required"].([]any)) != 1 {
+		t.Fatalf("parameters = %#v", parameters)
+	}
+	input := payload["input"].([]any)
+	call := input[0].(map[string]any)
+	if call["type"] != "function_call" || customInputFromArguments(call["arguments"]) != "raw patch" {
+		t.Fatalf("converted history call = %#v", call)
+	}
+	if input[1].(map[string]any)["type"] != "function_call_output" {
+		t.Fatalf("converted history output = %#v", input[1])
+	}
+	choice := payload["tool_choice"].(map[string]any)
+	if choice["type"] != "function" || choice["name"] != "patch" {
+		t.Fatalf("converted choice = %#v", choice)
+	}
+
+	response := []byte(`{"output":[{"type":"function_call","name":"patch","call_id":"call_1","arguments":"{\"input\":\"raw patch\"}"}]}`)
+	rewritten, changed := rewriteNamespaceToolCalls(response, mappings)
+	if !changed {
+		t.Fatal("expected custom response conversion")
+	}
+	item := decodeNamespacePayload(t, rewritten)["output"].([]any)[0].(map[string]any)
+	if item["type"] != "custom_tool_call" || item["input"] != "raw patch" {
+		t.Fatalf("rewritten custom call = %#v", item)
+	}
+}
+
+func TestConvertCustomToolStreamingEvents(t *testing.T) {
+	t.Parallel()
+
+	mappings := namespaceToolMappings{"patch": {Name: "patch", Custom: true}}
+	input := `data: {"type":"response.output_item.added","item":{"id":"item_1","type":"function_call","name":"patch","call_id":"call_1","arguments":""}}` + "\n\n" +
+		`data: {"type":"response.function_call_arguments.done","item_id":"item_1","arguments":"{\"input\":\"raw patch\"}"}` + "\n\n"
+	recorder := httptest.NewRecorder()
+	streamCopyWithNamespaceMappings(recorder, strings.NewReader(input), "text/event-stream", mappings, time.Now())
+	output := recorder.Body.String()
+	for _, expected := range []string{
+		`"type":"custom_tool_call"`,
+		`"type":"response.custom_tool_call_input.delta"`,
+		`"delta":"raw patch"`,
+		`"type":"response.custom_tool_call_input.done"`,
+	} {
+		if !strings.Contains(output, expected) {
+			t.Fatalf("stream output missing %s: %s", expected, output)
+		}
+	}
+	if strings.Contains(output, "response.function_call_arguments.done") {
+		t.Fatalf("function event leaked to custom client: %s", output)
 	}
 }
 
@@ -150,10 +231,80 @@ func TestFlattenNamespaceToolsAvoidsNameCollisions(t *testing.T) {
 func TestFlattenNamespaceToolsLeavesOrdinaryRequestUntouched(t *testing.T) {
 	t.Parallel()
 
-	body := []byte(`{"tools":[{"type":"function","name":"find","parameters":{"type":"object"}}]}`)
+	body := []byte(`{"tools":[{"type":"function","name":"find","description":"Find","parameters":{"type":"object"}}]}`)
 	normalized, mappings, changed := flattenNamespaceTools(body)
 	if changed || len(mappings) != 0 || !bytes.Equal(normalized, body) {
 		t.Fatalf("ordinary request changed: %s %#v", normalized, mappings)
+	}
+}
+
+func TestNormalizeOptionalToolChoiceWithoutTools(t *testing.T) {
+	t.Parallel()
+
+	for _, body := range []string{
+		`{"model":"grok-4.6","tool_choice":"auto"}`,
+		`{"model":"grok-4.6","tool_choice":"none","tools":[]}`,
+		`{"model":"grok-4.6","tool_choice":{"type":"auto"},"tools":[]}`,
+		`{"model":"grok-4.6","tool_choice":null,"tools":[]}`,
+	} {
+		normalized, changed, invalid := normalizeToolChoiceWithoutTools([]byte(body))
+		if !changed || invalid {
+			t.Fatalf("body=%s changed=%t invalid=%t", body, changed, invalid)
+		}
+		payload := decodeNamespacePayload(t, normalized)
+		if _, exists := payload["tool_choice"]; exists {
+			t.Fatalf("tool_choice retained: %s", normalized)
+		}
+		if _, exists := payload["tools"]; exists {
+			t.Fatalf("empty tools retained: %s", normalized)
+		}
+	}
+}
+
+func TestNormalizeRequiredToolChoiceWithoutToolsIsInvalid(t *testing.T) {
+	t.Parallel()
+
+	for _, body := range []string{
+		`{"tool_choice":"required"}`,
+		`{"tool_choice":{"type":"function","name":"lookup"},"tools":[]}`,
+		`{"tool_choice":{"type":"tool","name":"lookup"},"tools":[]}`,
+		`{"tool_choice":{"type":"any"},"tools":[]}`,
+	} {
+		normalized, changed, invalid := normalizeToolChoiceWithoutTools([]byte(body))
+		if changed || !invalid || !bytes.Equal(normalized, []byte(body)) {
+			t.Fatalf("body=%s normalized=%s changed=%t invalid=%t", body, normalized, changed, invalid)
+		}
+	}
+}
+
+func TestNormalizeToolChoiceKeepsRequestsWithTools(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"tool_choice":"required","tools":[{"type":"function","name":"lookup"}]}`)
+	normalized, changed, invalid := normalizeToolChoiceWithoutTools(body)
+	if changed || invalid || !bytes.Equal(normalized, body) {
+		t.Fatalf("normalized=%s changed=%t invalid=%t", normalized, changed, invalid)
+	}
+}
+
+func TestNormalizeToolChoiceAfterEmptyNamespaceFlatten(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"tool_choice":"auto","tools":[{"type":"namespace","name":"empty","tools":[]}]}`)
+	flattened, _, changed := flattenNamespaceTools(body)
+	if !changed {
+		t.Fatal("expected empty namespace to be flattened")
+	}
+	normalized, choiceChanged, invalid := normalizeToolChoiceWithoutTools(flattened)
+	if !choiceChanged || invalid {
+		t.Fatalf("normalized=%s changed=%t invalid=%t", normalized, choiceChanged, invalid)
+	}
+	payload := decodeNamespacePayload(t, normalized)
+	if _, exists := payload["tool_choice"]; exists {
+		t.Fatalf("tool_choice retained: %s", normalized)
+	}
+	if _, exists := payload["tools"]; exists {
+		t.Fatalf("empty tools retained: %s", normalized)
 	}
 }
 

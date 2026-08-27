@@ -81,9 +81,10 @@ func New(baseURL, webBaseURL string) *Client {
 func (c *Client) Fetch(ctx context.Context, accessToken string) (Usage, error) {
 	var payload struct {
 		Config struct {
-			CreditUsagePercent *float64 `json:"creditUsagePercent"`
-			BillingPeriodEnd   string   `json:"billingPeriodEnd"`
-			CurrentPeriod      struct {
+			CreditUsagePercent   *float64 `json:"creditUsagePercent"`
+			IsUnifiedBillingUser *bool    `json:"isUnifiedBillingUser"`
+			BillingPeriodEnd     string   `json:"billingPeriodEnd"`
+			CurrentPeriod        struct {
 				Type  string `json:"type"`
 				Start string `json:"start"`
 				End   string `json:"end"`
@@ -96,8 +97,18 @@ func (c *Client) Fetch(ctx context.Context, accessToken string) (Usage, error) {
 	if payload.Config.CurrentPeriod.Type != "USAGE_PERIOD_TYPE_WEEKLY" {
 		return Usage{}, fmt.Errorf("billing 返回了非周周期 %q", payload.Config.CurrentPeriod.Type)
 	}
-	if payload.Config.CreditUsagePercent == nil || math.IsNaN(*payload.Config.CreditUsagePercent) || math.IsInf(*payload.Config.CreditUsagePercent, 0) {
-		return Usage{}, errors.New("billing 响应缺少有效的周用量百分比")
+	// xAI 在人工重置后、尚未产生新用量时可能省略或返回 null；官方网页将其按 0% 处理。
+	// 明确处于非统一计费模式时不作这个推断，避免把不适用的配置误判为额度恢复。
+	used := 0.0
+	if payload.Config.CreditUsagePercent == nil {
+		if payload.Config.IsUnifiedBillingUser != nil && !*payload.Config.IsUnifiedBillingUser {
+			return Usage{}, errors.New("billing 响应缺少周用量百分比且账号未启用统一计费")
+		}
+	} else {
+		if math.IsNaN(*payload.Config.CreditUsagePercent) || math.IsInf(*payload.Config.CreditUsagePercent, 0) {
+			return Usage{}, errors.New("billing 响应包含无效的周用量百分比")
+		}
+		used = *payload.Config.CreditUsagePercent
 	}
 	resetValue := payload.Config.CurrentPeriod.End
 	if resetValue == "" {
@@ -108,7 +119,7 @@ func (c *Client) Fetch(ctx context.Context, accessToken string) (Usage, error) {
 		return Usage{}, fmt.Errorf("billing 响应包含无效重置时间: %w", err)
 	}
 	now := time.Now()
-	used := min(100, max(0, *payload.Config.CreditUsagePercent))
+	used = min(100, max(0, used))
 	usage := Usage{WeeklyUsedPercent: used, WeeklyResetAt: resetAt, UpdatedAt: now}
 
 	var settings struct {

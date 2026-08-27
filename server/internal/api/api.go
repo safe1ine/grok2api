@@ -308,6 +308,11 @@ type accountView struct {
 	ResetCreditExpiresAt  *time.Time `json:"reset_credit_expires_at"`
 }
 
+func applyAccountState(v *accountView, state pool.AccountState) {
+	v.Status = state.Status
+	v.CooldownUntil = state.CooldownUntil
+}
+
 func applyAccountUsage(v *accountView, usage billing.Usage) {
 	v.SubscriptionTier = usage.SubscriptionTier
 	v.WeeklyUsedPercent = &usage.WeeklyUsedPercent
@@ -334,6 +339,12 @@ func (h *Handler) ListAccounts(w http.ResponseWriter, r *http.Request) {
 	out := make([]accountView, 0, len(accs))
 	for _, a := range accs {
 		v := accountView{AccountRecord: a}
+		if a.SchedulingDisabled {
+			v.Status = pool.StatusDisabled
+			v.CooldownUntil = nil
+		} else if state, ok := h.pool.AccountState(a.ID); ok {
+			applyAccountState(&v, state)
+		}
 		if usage, ok := h.pool.BillingUsage(a.ID); ok {
 			applyAccountUsage(&v, usage)
 		}
@@ -366,6 +377,33 @@ func (h *Handler) RedeemAccountReset(w http.ResponseWriter, r *http.Request) {
 		"ok":                  true,
 		"weekly_used_percent": usage.WeeklyUsedPercent,
 	})
+}
+
+func (h *Handler) DisableAccount(w http.ResponseWriter, r *http.Request) {
+	h.setAccountSchedulingDisabled(w, r, true)
+}
+
+func (h *Handler) EnableAccount(w http.ResponseWriter, r *http.Request) {
+	h.setAccountSchedulingDisabled(w, r, false)
+}
+
+func (h *Handler) setAccountSchedulingDisabled(w http.ResponseWriter, r *http.Request, disabled bool) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "无效的账号 id")
+		return
+	}
+	found, err := h.store.SetAccountSchedulingDisabled(r.Context(), id, disabled)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, "账号不存在")
+		return
+	}
+	h.pool.SetSchedulingDisabled(id, disabled)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "scheduling_disabled": disabled})
 }
 
 func (h *Handler) DeleteAccount(w http.ResponseWriter, r *http.Request) {

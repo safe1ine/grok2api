@@ -22,6 +22,7 @@ export interface Account {
   created_at: string
   updated_at: string
   last_used_at: string | null
+  scheduling_disabled: boolean
   subscription_tier: string
   weekly_used_percent: number | null
   weekly_reset_at: string | null
@@ -35,6 +36,8 @@ export interface KeyItem {
   name: string
   prefix: string
   revoked: boolean
+  historical_calls: number
+  today_calls: number
   created_at: string
 }
 
@@ -45,6 +48,7 @@ export interface LogItem {
   model: string
   endpoint: string
   status: number
+  error_reason: string
   prompt_tokens: number
   cached_tokens: number
   completion_tokens: number
@@ -92,6 +96,12 @@ export interface ModelPricing {
   long_context_threshold: number
 }
 
+export interface UsageKeyOption {
+  id: number
+  name: string
+  prefix: string
+}
+
 export interface DashboardResponse {
   range_minutes: number
   timezone: string
@@ -99,6 +109,8 @@ export interface DashboardResponse {
   to: string
   points: DashboardPoint[]
   totals: DashboardTotals
+  models: string[]
+  keys: UsageKeyOption[]
   pricing: ModelPricing[]
   unpriced_models: string[]
   pricing_source: string

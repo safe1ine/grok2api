@@ -3,6 +3,8 @@ import { useCallback, useEffect, useState } from 'react'
 import { api, type KeyItem } from '../api'
 import { ConfirmDialog, TextInputDialog } from '../components/Dialogs'
 
+const callCountFormatter = new Intl.NumberFormat('zh-CN')
+
 export default function Keys() {
   const [keys, setKeys] = useState<KeyItem[]>([])
   const [loading, setLoading] = useState(false)
@@ -14,20 +16,22 @@ export default function Keys() {
   const [deleteTarget, setDeleteTarget] = useState<KeyItem | null>(null)
   const [deletingId, setDeletingId] = useState<number | null>(null)
 
-  const load = useCallback(async () => {
-    setLoading(true)
+  const load = useCallback(async (showLoading = true) => {
+    if (showLoading) setLoading(true)
     setError('')
     try {
       setKeys(await api<KeyItem[]>('/api/keys'))
     } catch (e) {
       setError(String(e))
     } finally {
-      setLoading(false)
+      if (showLoading) setLoading(false)
     }
   }, [])
 
   useEffect(() => {
-    load()
+    void load()
+    const timer = window.setInterval(() => void load(false), 60 * 1000)
+    return () => window.clearInterval(timer)
   }, [load])
 
   async function create() {
@@ -89,6 +93,8 @@ export default function Keys() {
               <th>名称</th>
               <th>前缀</th>
               <th>状态</th>
+              <th className="text-right">历史调用</th>
+              <th className="text-right">今日调用</th>
               <th>创建时间</th>
               <th>操作</th>
             </tr>
@@ -96,13 +102,13 @@ export default function Keys() {
           <tbody>
             {loading ? (
               <tr>
-                <td colSpan={6} className="text-center">
+                <td colSpan={8} className="text-center">
                   <span className="loading loading-spinner" />
                 </td>
               </tr>
             ) : keys.length === 0 ? (
               <tr>
-                <td colSpan={6} className="text-center text-base-content/50">
+                <td colSpan={8} className="text-center text-base-content/50">
                   还没有 Key，点击右上角创建
                 </td>
               </tr>
@@ -119,6 +125,8 @@ export default function Keys() {
                       {k.revoked ? '已撤销' : '生效中'}
                     </span>
                   </td>
+                  <td className="text-right tabular-nums">{callCountFormatter.format(k.historical_calls)}</td>
+                  <td className="text-right tabular-nums">{callCountFormatter.format(k.today_calls)}</td>
                   <td>{new Date(k.created_at).toLocaleString()}</td>
                   <td>
                     <button

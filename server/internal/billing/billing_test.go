@@ -74,6 +74,48 @@ func TestFetchUsesBillingPeriodEndAndKeepsUsageWhenSettingsFails(t *testing.T) {
 	}
 }
 
+func TestFetchTreatsMissingWeeklyUsageAsZero(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		config string
+	}{
+		{name: "missing", config: `"isUnifiedBillingUser":true,`},
+		{name: "null", config: `"creditUsagePercent":null,"isUnifiedBillingUser":true,`},
+		{name: "legacy response without unified flag", config: ``},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprintf(w, `{"config":{%s"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-08-31T08:12:21Z"}}}`, tc.config)
+			}))
+			defer server.Close()
+
+			usage, err := New(server.URL, server.URL).Fetch(context.Background(), "access-token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if usage.WeeklyUsedPercent != 0 {
+				t.Fatalf("usage = %+v, want 0%%", usage)
+			}
+		})
+	}
+}
+
+func TestFetchRejectsMissingUsageForExplicitNonUnifiedBilling(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"config":{"isUnifiedBillingUser":false,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-08-31T08:12:21Z"}}}`))
+	}))
+	defer server.Close()
+
+	if _, err := New(server.URL, server.URL).Fetch(context.Background(), "access-token"); err == nil {
+		t.Fatal("expected missing usage error for non-unified billing")
+	}
+}
+
 func TestFetchRejectsNonWeeklyPeriod(t *testing.T) {
 	t.Parallel()
 

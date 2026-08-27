@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"grok2api/server/internal/store"
@@ -48,16 +49,18 @@ type dashboardTotals struct {
 }
 
 type dashboardResponse struct {
-	RangeMinutes   int              `json:"range_minutes"`
-	Timezone       string           `json:"timezone"`
-	From           string           `json:"from"`
-	To             string           `json:"to"`
-	Points         []dashboardPoint `json:"points"`
-	Totals         dashboardTotals  `json:"totals"`
-	Pricing        []modelPricing   `json:"pricing"`
-	UnpricedModels []string         `json:"unpriced_models"`
-	PricingSource  string           `json:"pricing_source"`
-	PricingAsOf    string           `json:"pricing_as_of"`
+	RangeMinutes   int                    `json:"range_minutes"`
+	Timezone       string                 `json:"timezone"`
+	From           string                 `json:"from"`
+	To             string                 `json:"to"`
+	Points         []dashboardPoint       `json:"points"`
+	Totals         dashboardTotals        `json:"totals"`
+	Models         []string               `json:"models"`
+	Keys           []store.UsageKeyOption `json:"keys"`
+	Pricing        []modelPricing         `json:"pricing"`
+	UnpricedModels []string               `json:"unpriced_models"`
+	PricingSource  string                 `json:"pricing_source"`
+	PricingAsOf    string                 `json:"pricing_as_of"`
 }
 
 var officialModelPricing = buildOfficialModelPricing()
@@ -106,20 +109,42 @@ func estimateUsageCost(usage store.MinuteUsage) (float64, modelPricing, bool) {
 	if !ok {
 		return 0, modelPricing{}, false
 	}
-	inputRate, cachedRate, outputRate := price.InputUSDPerMillion, price.CachedUSDPerMillion, price.OutputUSDPerMillion
-	if usage.LongContext {
-		inputRate, cachedRate, outputRate = price.LongInputUSD, price.LongCachedUSD, price.LongOutputUSD
-	}
-	cached := usage.CachedTokens
-	if cached < 0 {
-		cached = 0
-	}
-	if cached > usage.PromptTokens {
-		cached = usage.PromptTokens
-	}
-	uncached := usage.PromptTokens - cached
-	cost := (float64(uncached)*inputRate + float64(cached)*cachedRate + float64(usage.CompletionTokens)*outputRate) / 1_000_000
+
+	input := max(int64(0), usage.PromptTokens)
+	cached := min(input, max(int64(0), usage.CachedTokens))
+	output := max(int64(0), usage.CompletionTokens)
+	longInput := min(input, max(int64(0), usage.LongContextPromptTokens))
+	longCached := min(longInput, cached, max(int64(0), usage.LongContextCachedTokens))
+	longOutput := min(output, max(int64(0), usage.LongContextCompletionTokens))
+
+	standardInput := input - longInput
+	standardCached := min(standardInput, cached-longCached)
+	standardOutput := output - longOutput
+	standardUncached := standardInput - standardCached
+	longUncached := longInput - longCached
+
+	cost := (float64(standardUncached)*price.InputUSDPerMillion +
+		float64(standardCached)*price.CachedUSDPerMillion +
+		float64(standardOutput)*price.OutputUSDPerMillion +
+		float64(longUncached)*price.LongInputUSD +
+		float64(longCached)*price.LongCachedUSD +
+		float64(longOutput)*price.LongOutputUSD) / 1_000_000
 	return cost, price, true
+}
+
+type dashboardFilters struct {
+	Model string
+	KeyID *int64
+}
+
+func parseDashboardFilters(r *http.Request) dashboardFilters {
+	filters := dashboardFilters{Model: strings.TrimSpace(r.URL.Query().Get("model"))}
+	if value := r.URL.Query().Get("key_id"); value != "" {
+		if parsed, err := strconv.ParseInt(value, 10, 64); err == nil && parsed > 0 {
+			filters.KeyID = &parsed
+		}
+	}
+	return filters
 }
 
 func parseDashboardRange(r *http.Request) int {
@@ -139,10 +164,21 @@ func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	minutes := parseDashboardRange(r)
+	filters := parseDashboardFilters(r)
 	end := time.Now().In(loc).Truncate(time.Minute).Add(time.Minute)
 	start := end.Add(-time.Duration(minutes) * time.Minute)
 
-	usage, err := h.store.ListMinuteUsage(r.Context(), start, end)
+	usage, err := h.store.ListMinuteUsage(r.Context(), start, end, filters.Model, filters.KeyID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	models, err := h.store.ListUsageModels(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	keys, err := h.store.ListUsageKeyOptions(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -178,6 +214,8 @@ func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
 		From:           start.Format(time.RFC3339),
 		To:             end.Format(time.RFC3339),
 		Points:         points,
+		Models:         models,
+		Keys:           keys,
 		Pricing:        make([]modelPricing, 0),
 		UnpricedModels: make([]string, 0),
 		PricingSource:  pricingSource,

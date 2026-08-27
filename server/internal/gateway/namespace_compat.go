@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -16,6 +17,7 @@ import (
 type namespaceToolMapping struct {
 	Namespace string
 	Name      string
+	Custom    bool
 }
 
 type namespaceToolMappings map[string]namespaceToolMapping
@@ -45,7 +47,11 @@ func flattenNamespaceTools(body []byte) ([]byte, namespaceToolMappings, bool) {
 
 	usedNames := map[string]bool{}
 	for _, rawTool := range tools {
-		if tool, ok := rawTool.(map[string]any); ok && tool["type"] == "function" {
+		tool, ok := rawTool.(map[string]any)
+		if !ok {
+			continue
+		}
+		if toolType, _ := tool["type"].(string); toolType == "function" {
 			if name, ok := tool["name"].(string); ok {
 				usedNames[name] = true
 			}
@@ -58,18 +64,51 @@ func flattenNamespaceTools(body []byte) ([]byte, namespaceToolMappings, bool) {
 	changed := discoveryChanged
 	for _, rawTool := range tools {
 		tool, ok := rawTool.(map[string]any)
-		if !ok || tool["type"] != "namespace" {
+		if !ok {
 			flattened = append(flattened, rawTool)
 			continue
 		}
+		toolType, _ := tool["type"].(string)
+		switch toolType {
+		case "function":
+			if function, ok := tool["function"].(map[string]any); ok {
+				changed = ensureFunctionDescription(function, "") || changed
+			} else {
+				changed = ensureFunctionDescription(tool, "") || changed
+			}
+			flattened = append(flattened, tool)
+			continue
+		case "custom":
+			name, _ := tool["name"].(string)
+			if name == "" {
+				changed = true
+				continue
+			}
+			flatName := uniqueNamespaceToolName("", name, usedNames)
+			usedNames[flatName] = true
+			mappings[flatName] = namespaceToolMapping{Name: name, Custom: true}
+			flattened = append(flattened, customToolAsFunction(tool, flatName, ""))
+			changed = true
+			continue
+		case "namespace":
+			// 展平后继续处理 namespace 子工具。
+		default:
+			flattened = append(flattened, tool)
+			continue
+		}
+
 		changed = true
 		namespace, _ := tool["name"].(string)
 		namespaceDescription, _ := tool["description"].(string)
 		children, _ := tool["tools"].([]any)
 		for _, rawChild := range children {
 			child, ok := rawChild.(map[string]any)
-			if !ok || child["type"] != "function" {
-				continue // xAI 不支持 namespace 中的 custom 工具。
+			if !ok {
+				continue
+			}
+			childType, _ := child["type"].(string)
+			if childType != "function" && childType != "custom" {
+				continue
 			}
 			childName, _ := child["name"].(string)
 			if childName == "" {
@@ -82,18 +121,13 @@ func flattenNamespaceTools(body []byte) ([]byte, namespaceToolMappings, bool) {
 			seenNamespaceChildren[semanticName] = true
 			flatName := uniqueNamespaceToolName(namespace, childName, usedNames)
 			usedNames[flatName] = true
-			mappings[flatName] = namespaceToolMapping{Namespace: namespace, Name: childName}
-
-			flatTool := map[string]any{"type": "function", "name": flatName}
-			if description := namespacedToolDescription(namespaceDescription, child["description"]); description != "" {
-				flatTool["description"] = description
+			mapping := namespaceToolMapping{Namespace: namespace, Name: childName, Custom: childType == "custom"}
+			mappings[flatName] = mapping
+			if mapping.Custom {
+				flattened = append(flattened, customToolAsFunction(child, flatName, namespaceDescription))
+			} else {
+				flattened = append(flattened, namespacedFunctionTool(child, flatName, namespaceDescription))
 			}
-			for _, key := range []string{"parameters", "strict"} {
-				if value, exists := child[key]; exists && value != nil {
-					flatTool[key] = value
-				}
-			}
-			flattened = append(flattened, flatTool)
 		}
 	}
 	if !changed {
@@ -151,6 +185,55 @@ func promoteDiscoveredTools(payload map[string]any) bool {
 	return true
 }
 
+const fallbackToolDescription = "Invoke this tool."
+
+func ensureFunctionDescription(tool map[string]any, namespaceDescription string) bool {
+	description := namespacedToolDescription(namespaceDescription, tool["description"])
+	if description == "" {
+		description = fallbackToolDescription
+	}
+	if tool["description"] == description {
+		return false
+	}
+	tool["description"] = description
+	return true
+}
+
+func namespacedFunctionTool(child map[string]any, flatName, namespaceDescription string) map[string]any {
+	flatTool := map[string]any{"type": "function", "name": flatName}
+	description := namespacedToolDescription(namespaceDescription, child["description"])
+	if description == "" {
+		description = fallbackToolDescription
+	}
+	flatTool["description"] = description
+	for _, key := range []string{"parameters", "strict"} {
+		if value, exists := child[key]; exists && value != nil {
+			flatTool[key] = value
+		}
+	}
+	return flatTool
+}
+
+func customToolAsFunction(tool map[string]any, flatName, namespaceDescription string) map[string]any {
+	description := namespacedToolDescription(namespaceDescription, tool["description"])
+	if description == "" {
+		description = fallbackToolDescription
+	}
+	return map[string]any{
+		"type":        "function",
+		"name":        flatName,
+		"description": description,
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"input": map[string]any{"type": "string"},
+			},
+			"required":             []any{"input"},
+			"additionalProperties": false,
+		},
+	}
+}
+
 func namespacedToolDescription(namespaceDescription string, childDescription any) string {
 	child, _ := childDescription.(string)
 	switch {
@@ -164,7 +247,11 @@ func namespacedToolDescription(namespaceDescription string, childDescription any
 }
 
 func uniqueNamespaceToolName(namespace, child string, used map[string]bool) string {
-	base := sanitizeToolName(namespace + "__" + child)
+	qualifiedName := child
+	if namespace != "" {
+		qualifiedName = namespace + "__" + child
+	}
+	base := sanitizeToolName(qualifiedName)
 	if base == "" {
 		base = "namespace_tool"
 	}
@@ -222,16 +309,105 @@ func rewriteNamespacedCallsForUpstream(value any, mappings namespaceToolMappings
 		reverse[mapping.Namespace+"\x00"+mapping.Name] = flatName
 	}
 	walkJSON(value, func(object map[string]any) {
-		if object["type"] != "function_call" {
-			return
-		}
-		namespace, _ := object["namespace"].(string)
-		name, _ := object["name"].(string)
-		if flatName, ok := reverse[namespace+"\x00"+name]; ok {
+		switch object["type"] {
+		case "function_call":
+			namespace, _ := object["namespace"].(string)
+			name, _ := object["name"].(string)
+			if flatName, ok := reverse[namespace+"\x00"+name]; ok {
+				object["name"] = flatName
+				delete(object, "namespace")
+			}
+		case "custom_tool_call":
+			namespace, _ := object["namespace"].(string)
+			name, _ := object["name"].(string)
+			flatName, ok := reverse[namespace+"\x00"+name]
+			if !ok || !mappings[flatName].Custom {
+				return
+			}
+			arguments, _ := json.Marshal(map[string]any{"input": customToolInput(object["input"])})
+			object["type"] = "function_call"
 			object["name"] = flatName
+			object["arguments"] = string(arguments)
+			delete(object, "input")
 			delete(object, "namespace")
+		case "custom_tool_call_output":
+			object["type"] = "function_call_output"
 		}
 	})
+}
+
+func customToolInput(value any) string {
+	if input, ok := value.(string); ok {
+		return input
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
+}
+
+// normalizeToolChoiceWithoutTools 修复 SDK 在没有工具时仍发送 auto/none tool_choice 的情况。
+// required 或指定函数无法在没有工具定义时满足，由调用方返回明确的本地错误。
+func normalizeToolChoiceWithoutTools(body []byte) (normalized []byte, changed, invalid bool) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var payload map[string]any
+	if err := dec.Decode(&payload); err != nil {
+		return body, false, false
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return body, false, false
+	}
+
+	choice, hasChoice := payload["tool_choice"]
+	tools, hasToolArray := payload["tools"].([]any)
+	hasTools := false
+	for _, rawTool := range tools {
+		if tool, ok := rawTool.(map[string]any); ok && len(tool) > 0 {
+			hasTools = true
+			break
+		}
+	}
+	if hasTools {
+		return body, false, false
+	}
+	if hasChoice && !optionalToolChoice(choice) {
+		return body, false, true
+	}
+
+	if hasChoice {
+		delete(payload, "tool_choice")
+		changed = true
+	}
+	if hasToolArray && len(tools) == 0 {
+		delete(payload, "tools")
+		changed = true
+	}
+	if !changed {
+		return body, false, false
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return body, false, false
+	}
+	return encoded, true, false
+}
+
+func optionalToolChoice(choice any) bool {
+	if choice == nil {
+		return true
+	}
+	var choiceType string
+	switch choice := choice.(type) {
+	case string:
+		choiceType = choice
+	case map[string]any:
+		choiceType, _ = choice["type"].(string)
+	}
+	choiceType = strings.ToLower(strings.TrimSpace(choiceType))
+	return choiceType == "auto" || choiceType == "none"
 }
 
 func rewriteNamespacedToolChoice(payload map[string]any, mappings namespaceToolMappings) {
@@ -272,7 +448,14 @@ func rewriteNamespaceToolCalls(body []byte, mappings namespaceToolMappings) ([]b
 			return
 		}
 		object["name"] = mapping.Name
-		object["namespace"] = mapping.Namespace
+		if mapping.Namespace != "" {
+			object["namespace"] = mapping.Namespace
+		}
+		if mapping.Custom {
+			object["type"] = "custom_tool_call"
+			object["input"] = customInputFromArguments(object["arguments"])
+			delete(object, "arguments")
+		}
 		changed = true
 	})
 	if !changed {
@@ -283,6 +466,22 @@ func rewriteNamespaceToolCalls(body []byte, mappings namespaceToolMappings) ([]b
 		return body, false
 	}
 	return rewritten, true
+}
+
+func customInputFromArguments(value any) string {
+	arguments, ok := value.(string)
+	if !ok {
+		return customToolInput(value)
+	}
+	dec := json.NewDecoder(strings.NewReader(arguments))
+	dec.UseNumber()
+	var object map[string]any
+	if err := dec.Decode(&object); err == nil {
+		if input, ok := object["input"].(string); ok {
+			return input
+		}
+	}
+	return arguments
 }
 
 func walkJSON(value any, visit func(map[string]any)) {
@@ -297,6 +496,131 @@ func walkJSON(value any, visit func(map[string]any)) {
 			walkJSON(child, visit)
 		}
 	}
+}
+
+type customToolStreamState struct {
+	mappingsByItem  map[string]namespaceToolMapping
+	argumentsByItem map[string]string
+	inputDoneByItem map[string]bool
+}
+
+func (s *customToolStreamState) rewrite(payload []byte, mappings namespaceToolMappings) ([][]byte, bool) {
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.UseNumber()
+	var event map[string]any
+	if err := dec.Decode(&event); err != nil {
+		return nil, false
+	}
+	eventType, _ := event["type"].(string)
+	itemID, _ := event["item_id"].(string)
+	if s.mappingsByItem == nil {
+		s.mappingsByItem = make(map[string]namespaceToolMapping)
+		s.argumentsByItem = make(map[string]string)
+		s.inputDoneByItem = make(map[string]bool)
+	}
+
+	switch eventType {
+	case "response.output_item.added", "response.output_item.done":
+		item, _ := event["item"].(map[string]any)
+		if item == nil || item["type"] != "function_call" {
+			return nil, false
+		}
+		name, _ := item["name"].(string)
+		mapping, ok := mappings[name]
+		if !ok || !mapping.Custom {
+			return nil, false
+		}
+		itemID, _ = item["id"].(string)
+		if eventType == "response.output_item.added" && itemID != "" {
+			s.mappingsByItem[itemID] = mapping
+		}
+		item["type"] = "custom_tool_call"
+		item["name"] = mapping.Name
+		if mapping.Namespace != "" {
+			item["namespace"] = mapping.Namespace
+		}
+		arguments := item["arguments"]
+		if customToolInput(arguments) == "" && itemID != "" && s.argumentsByItem[itemID] != "" {
+			arguments = s.argumentsByItem[itemID]
+		}
+		input := customInputFromArguments(arguments)
+		item["input"] = input
+		delete(item, "arguments")
+		payloads := make([][]byte, 0, 2)
+		if eventType == "response.output_item.done" && itemID != "" && !s.inputDoneByItem[itemID] && input != "" {
+			deltaEvent := map[string]any{
+				"type": "response.custom_tool_call_input.delta", "item_id": itemID, "delta": input,
+			}
+			if outputIndex, exists := event["output_index"]; exists {
+				deltaEvent["output_index"] = outputIndex
+			}
+			deltaPayload, _ := json.Marshal(deltaEvent)
+			payloads = append(payloads, deltaPayload)
+		}
+		encoded, _ := json.Marshal(event)
+		payloads = append(payloads, encoded)
+		if eventType == "response.output_item.done" && itemID != "" {
+			delete(s.mappingsByItem, itemID)
+			delete(s.argumentsByItem, itemID)
+			delete(s.inputDoneByItem, itemID)
+		}
+		return payloads, true
+	case "response.function_call_arguments.delta":
+		mapping, ok := s.mappingsByItem[itemID]
+		if !ok || !mapping.Custom {
+			return nil, false
+		}
+		fragment, _ := event["delta"].(string)
+		if fragment == "" {
+			fragment, _ = event["arguments"].(string)
+		}
+		s.argumentsByItem[itemID] += fragment
+		return [][]byte{}, true
+	case "response.function_call_arguments.done":
+		mapping, ok := s.mappingsByItem[itemID]
+		if !ok || !mapping.Custom {
+			return nil, false
+		}
+		arguments, _ := event["arguments"].(string)
+		if arguments == "" {
+			arguments = s.argumentsByItem[itemID]
+		}
+		input := customInputFromArguments(arguments)
+		deltaEvent := cloneSchemaValue(event).(map[string]any)
+		deltaEvent["type"] = "response.custom_tool_call_input.delta"
+		deltaEvent["delta"] = input
+		delete(deltaEvent, "arguments")
+		doneEvent := cloneSchemaValue(event).(map[string]any)
+		doneEvent["type"] = "response.custom_tool_call_input.done"
+		doneEvent["input"] = input
+		delete(doneEvent, "arguments")
+		delete(doneEvent, "delta")
+		delete(s.argumentsByItem, itemID)
+		s.inputDoneByItem[itemID] = true
+		deltaPayload, _ := json.Marshal(deltaEvent)
+		donePayload, _ := json.Marshal(doneEvent)
+		return [][]byte{deltaPayload, donePayload}, true
+	}
+	return nil, false
+}
+
+func formatSSEPayloads(payloads [][]byte, lineEnding string) string {
+	if len(payloads) == 0 {
+		return ""
+	}
+	if lineEnding == "" {
+		lineEnding = "\n"
+	}
+	var output strings.Builder
+	for index, payload := range payloads {
+		if index > 0 {
+			output.WriteString(lineEnding)
+		}
+		output.WriteString("data: ")
+		output.Write(payload)
+		output.WriteString(lineEnding)
+	}
+	return output.String()
 }
 
 type streamCompatibilityOptions struct {
@@ -347,6 +671,8 @@ func streamCopyNamespaceSSE(
 	reader := bufio.NewReaderSize(body, 32*1024)
 	flusher, canFlush := w.(http.Flusher)
 	indexState := anthropicStreamIndexState{}
+	customState := customToolStreamState{}
+	downstreamWritable := true
 	for {
 		line, err := reader.ReadString('\n')
 		if line != "" {
@@ -356,40 +682,49 @@ func streamCopyNamespaceSSE(
 		trimmed := strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
 		if strings.HasPrefix(trimmed, "data:") {
 			data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
-			if data != "" && data != "[DONE]" {
+			if data == "[DONE]" {
+				metrics.StreamCompleted = true
+			} else if data != "" {
 				payload := []byte(data)
 				observeResponsePayload(payload, &metrics, start)
+				lineEnding := ""
+				if strings.HasSuffix(line, "\r\n") {
+					lineEnding = "\r\n"
+				} else if strings.HasSuffix(line, "\n") {
+					lineEnding = "\n"
+				}
+				if customPayloads, handled := customState.rewrite(payload, mappings); handled {
+					output = formatSSEPayloads(customPayloads, lineEnding)
+					payload = nil
+				}
 				changed := false
-				if options.fillAnthropicIndexes {
+				if payload != nil && options.fillAnthropicIndexes {
 					if rewritten, indexChanged := indexState.fillMissingIndex(payload); indexChanged {
 						payload = rewritten
 						changed = true
 					}
 				}
-				if rewritten, namespaceChanged := rewriteNamespaceToolCalls(payload, mappings); namespaceChanged {
-					payload = rewritten
-					changed = true
-				}
-				if changed {
-					lineEnding := ""
-					if strings.HasSuffix(line, "\r\n") {
-						lineEnding = "\r\n"
-					} else if strings.HasSuffix(line, "\n") {
-						lineEnding = "\n"
+				if payload != nil {
+					if rewritten, namespaceChanged := rewriteNamespaceToolCalls(payload, mappings); namespaceChanged {
+						payload = rewritten
+						changed = true
 					}
-					output = "data: " + string(payload) + lineEnding
+					if changed {
+						output = "data: " + string(payload) + lineEnding
+					}
 				}
 			}
 		}
-		if output != "" {
+		if downstreamWritable && output != "" {
 			if _, writeErr := io.WriteString(w, output); writeErr != nil {
-				return metrics
-			}
-			if canFlush {
+				downstreamWritable = false
+				metrics.DownstreamDisconnected = true
+			} else if canFlush {
 				flusher.Flush()
 			}
 		}
 		if err != nil {
+			metrics.UpstreamReadError = !errors.Is(err, io.EOF)
 			return metrics
 		}
 	}

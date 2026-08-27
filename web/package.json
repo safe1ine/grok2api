@@ -4,7 +4,11 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "fonts:build": "python3 scripts/build-maple-fonts.py --force",
+    "fonts:check": "python3 scripts/build-maple-fonts.py --check",
+    "predev": "python3 scripts/build-maple-fonts.py",
     "dev": "vite",
+    "prebuild": "python3 scripts/build-maple-fonts.py",
     "build": "tsc -b && vite build",
     "preview": "vite preview"
   },

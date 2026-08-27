@@ -178,6 +178,8 @@ func main() {
 			g.Post("/oauth/device", h.DeviceStart)
 			g.Get("/oauth/device/status", h.DeviceStatus)
 			g.Get("/accounts", h.ListAccounts)
+			g.Post("/accounts/{id}/disable", h.DisableAccount)
+			g.Post("/accounts/{id}/enable", h.EnableAccount)
 			g.Post("/accounts/{id}/redeem-reset", h.RedeemAccountReset)
 			g.Delete("/accounts/{id}", h.DeleteAccount)
 			g.Get("/keys", h.ListKeys)

@@ -15,41 +15,53 @@ import (
 var migrationsFS embed.FS
 
 type AccountRecord struct {
-	ID            int64      `json:"id"`
-	Email         string     `json:"email"`
-	Subject       string     `json:"subject"`
-	Status        string     `json:"status"`
-	CooldownUntil *time.Time `json:"cooldown_until"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
-	LastUsedAt    *time.Time `json:"last_used_at"`
+	ID                 int64      `json:"id"`
+	Email              string     `json:"email"`
+	Subject            string     `json:"subject"`
+	Status             string     `json:"status"`
+	CooldownUntil      *time.Time `json:"cooldown_until"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+	LastUsedAt         *time.Time `json:"last_used_at"`
+	SchedulingDisabled bool       `json:"scheduling_disabled"`
 }
 
 // PoolAccount 载入账号池用（含解密后的 refresh_token）。
 type PoolAccount struct {
-	ID           int64
-	Email        string
-	Status       string
-	RefreshToken string
+	ID                 int64
+	Email              string
+	Status             string
+	RefreshToken       string
+	SchedulingDisabled bool
 }
 
 type KeyRecord struct {
-	ID        int64     `json:"id"`
-	Name      string    `json:"name"`
-	KeyHash   string    `json:"-"`
-	Prefix    string    `json:"prefix"`
-	Revoked   bool      `json:"revoked"`
-	CreatedAt time.Time `json:"created_at"`
+	ID              int64     `json:"id"`
+	Name            string    `json:"name"`
+	KeyHash         string    `json:"-"`
+	Prefix          string    `json:"prefix"`
+	Revoked         bool      `json:"revoked"`
+	HistoricalCalls int64     `json:"historical_calls"`
+	TodayCalls      int64     `json:"today_calls"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
+type UsageKeyOption struct {
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	Prefix string `json:"prefix"`
 }
 
 type MinuteUsage struct {
-	Minute           time.Time
-	Model            string
-	LongContext      bool
-	Calls            int64
-	PromptTokens     int64
-	CachedTokens     int64
-	CompletionTokens int64
+	Minute                      time.Time
+	Model                       string
+	Calls                       int64
+	PromptTokens                int64
+	CachedTokens                int64
+	CompletionTokens            int64
+	LongContextPromptTokens     int64
+	LongContextCachedTokens     int64
+	LongContextCompletionTokens int64
 }
 
 type CallLog struct {
@@ -59,6 +71,7 @@ type CallLog struct {
 	Model            string    `json:"model"`
 	Endpoint         string    `json:"endpoint"`
 	Status           int       `json:"status"`
+	ErrorReason      string    `json:"error_reason"`
 	PromptTokens     int       `json:"prompt_tokens"`
 	CachedTokens     int       `json:"cached_tokens"`
 	CompletionTokens int       `json:"completion_tokens"`
@@ -158,7 +171,8 @@ func (s *Store) migrate(ctx context.Context) error {
 
 func (s *Store) ListAccounts(ctx context.Context) ([]AccountRecord, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, email, subject, status, cooldown_until, created_at, updated_at, last_used_at
+		SELECT id, email, subject, status, cooldown_until, created_at, updated_at, last_used_at,
+		       scheduling_disabled
 		FROM accounts ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
@@ -169,7 +183,10 @@ func (s *Store) ListAccounts(ctx context.Context) ([]AccountRecord, error) {
 	for rows.Next() {
 		var a AccountRecord
 		var email, subject *string
-		if err := rows.Scan(&a.ID, &email, &subject, &a.Status, &a.CooldownUntil, &a.CreatedAt, &a.UpdatedAt, &a.LastUsedAt); err != nil {
+		if err := rows.Scan(
+			&a.ID, &email, &subject, &a.Status, &a.CooldownUntil,
+			&a.CreatedAt, &a.UpdatedAt, &a.LastUsedAt, &a.SchedulingDisabled,
+		); err != nil {
 			return nil, err
 		}
 		if email != nil {
@@ -184,7 +201,10 @@ func (s *Store) ListAccounts(ctx context.Context) ([]AccountRecord, error) {
 }
 
 func (s *Store) ListPoolAccounts(ctx context.Context) ([]PoolAccount, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, email, status, refresh_token_enc FROM accounts WHERE status = 'active'`)
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, email, status, refresh_token_enc, scheduling_disabled
+		FROM accounts
+		WHERE status = 'active'`)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +215,7 @@ func (s *Store) ListPoolAccounts(ctx context.Context) ([]PoolAccount, error) {
 		var p PoolAccount
 		var email *string
 		var enc []byte
-		if err := rows.Scan(&p.ID, &email, &p.Status, &enc); err != nil {
+		if err := rows.Scan(&p.ID, &email, &p.Status, &enc, &p.SchedulingDisabled); err != nil {
 			return nil, err
 		}
 		if email != nil {
@@ -224,6 +244,7 @@ func (s *Store) CreateAccount(ctx context.Context, email, subject, refreshToken 
 		    subject = EXCLUDED.subject,
 		    refresh_token_enc = EXCLUDED.refresh_token_enc,
 		    status = 'active',
+		    scheduling_disabled = false,
 		    updated_at = now()
 		RETURNING id`, email, subject, enc).Scan(&id)
 	return id, err
@@ -241,6 +262,17 @@ func (s *Store) UpdateRefreshToken(ctx context.Context, id int64, refreshToken s
 func (s *Store) SetAccountStatus(ctx context.Context, id int64, status string) error {
 	_, err := s.pool.Exec(ctx, `UPDATE accounts SET status = $1, updated_at = now() WHERE id = $2`, status, id)
 	return err
+}
+
+func (s *Store) SetAccountSchedulingDisabled(ctx context.Context, id int64, disabled bool) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE accounts
+		SET scheduling_disabled = $2, updated_at = now()
+		WHERE id = $1`, id, disabled)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 func (s *Store) DeleteAccount(ctx context.Context, id int64) error {
@@ -289,7 +321,20 @@ func (s *Store) CreateKey(ctx context.Context, name, keyHash, prefix string) (in
 
 func (s *Store) ListKeys(ctx context.Context) ([]KeyRecord, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, name, key_hash, prefix, revoked, created_at FROM api_keys ORDER BY id DESC`)
+		SELECT k.id, k.name, k.key_hash, k.prefix, k.revoked,
+		       COALESCE(usage.historical_calls, 0), COALESCE(usage.today_calls, 0),
+		       k.created_at
+		FROM api_keys k
+		LEFT JOIN LATERAL (
+			SELECT sum(s.calls) AS historical_calls,
+			       sum(s.calls) FILTER (
+				       WHERE s.minute >= date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'
+				         AND s.minute < (date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') + interval '1 day') AT TIME ZONE 'Asia/Shanghai'
+			       ) AS today_calls
+			FROM minute_usage_stats s
+			WHERE s.key_id = k.id
+		) usage ON true
+		ORDER BY k.id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -298,7 +343,10 @@ func (s *Store) ListKeys(ctx context.Context) ([]KeyRecord, error) {
 	out := make([]KeyRecord, 0)
 	for rows.Next() {
 		var k KeyRecord
-		if err := rows.Scan(&k.ID, &k.Name, &k.KeyHash, &k.Prefix, &k.Revoked, &k.CreatedAt); err != nil {
+		if err := rows.Scan(
+			&k.ID, &k.Name, &k.KeyHash, &k.Prefix, &k.Revoked,
+			&k.HistoricalCalls, &k.TodayCalls, &k.CreatedAt,
+		); err != nil {
 			return nil, err
 		}
 		out = append(out, k)
@@ -345,13 +393,38 @@ func (s *Store) ListActiveKeyHashes(ctx context.Context) (map[string]int64, erro
 // ---------- 调用记录 ----------
 
 func (s *Store) InsertCallLog(ctx context.Context, l CallLog) error {
+	// 原始日志和分钟统计在同一条 SQL 中提交，任一写入失败都会整体回滚。
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO call_logs (
-			key_id, account_id, model, endpoint, status, prompt_tokens, cached_tokens,
-			completion_tokens, ttft_ms, latency_ms, stream
+		WITH inserted AS (
+			INSERT INTO call_logs (
+				key_id, account_id, model, endpoint, status, error_reason, prompt_tokens, cached_tokens,
+				completion_tokens, ttft_ms, latency_ms, stream
+			)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			RETURNING created_at, key_id, model, prompt_tokens, cached_tokens, completion_tokens
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-		l.KeyID, l.AccountID, l.Model, l.Endpoint, l.Status, l.PromptTokens, l.CachedTokens,
+		INSERT INTO minute_usage_stats (
+			minute, key_id, model_name, calls,
+			input_tokens, cached_tokens, output_tokens,
+			long_context_input_tokens, long_context_cached_tokens, long_context_output_tokens
+		)
+		SELECT
+			date_trunc('minute', created_at), COALESCE(key_id, 0), COALESCE(model, ''), 1,
+			prompt_tokens, cached_tokens, completion_tokens,
+			CASE WHEN prompt_tokens > 200000 THEN prompt_tokens ELSE 0 END,
+			CASE WHEN prompt_tokens > 200000 THEN cached_tokens ELSE 0 END,
+			CASE WHEN prompt_tokens > 200000 THEN completion_tokens ELSE 0 END
+		FROM inserted
+		ON CONFLICT (minute, key_id, model_name) DO UPDATE SET
+			calls = minute_usage_stats.calls + EXCLUDED.calls,
+			input_tokens = minute_usage_stats.input_tokens + EXCLUDED.input_tokens,
+			cached_tokens = minute_usage_stats.cached_tokens + EXCLUDED.cached_tokens,
+			output_tokens = minute_usage_stats.output_tokens + EXCLUDED.output_tokens,
+			long_context_input_tokens = minute_usage_stats.long_context_input_tokens + EXCLUDED.long_context_input_tokens,
+			long_context_cached_tokens = minute_usage_stats.long_context_cached_tokens + EXCLUDED.long_context_cached_tokens,
+			long_context_output_tokens = minute_usage_stats.long_context_output_tokens + EXCLUDED.long_context_output_tokens,
+			updated_at = now()`,
+		l.KeyID, l.AccountID, l.Model, l.Endpoint, l.Status, l.ErrorReason, l.PromptTokens, l.CachedTokens,
 		l.CompletionTokens, l.TTFTMs, l.LatencyMs, l.Stream)
 	return err
 }
@@ -362,16 +435,27 @@ func (s *Store) CountCallLogs(ctx context.Context) (int64, error) {
 	return total, err
 }
 
-func (s *Store) ListMinuteUsage(ctx context.Context, start, end time.Time) ([]MinuteUsage, error) {
+func (s *Store) ListMinuteUsage(
+	ctx context.Context,
+	start, end time.Time,
+	model string,
+	keyID *int64,
+) ([]MinuteUsage, error) {
+	var keyFilter any
+	if keyID != nil {
+		keyFilter = *keyID
+	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT date_trunc('minute', created_at) AS minute,
-		       COALESCE(model, ''), prompt_tokens > 200000 AS long_context,
-		       count(*), COALESCE(sum(prompt_tokens), 0), COALESCE(sum(cached_tokens), 0),
-		       COALESCE(sum(completion_tokens), 0)
-		FROM call_logs
-		WHERE created_at >= $1 AND created_at < $2
-		GROUP BY minute, COALESCE(model, ''), long_context
-		ORDER BY minute`, start, end)
+		SELECT minute, model_name,
+		       sum(calls), sum(input_tokens), sum(cached_tokens), sum(output_tokens),
+		       sum(long_context_input_tokens), sum(long_context_cached_tokens),
+		       sum(long_context_output_tokens)
+		FROM minute_usage_stats
+		WHERE minute >= $1 AND minute < $2
+		  AND ($3 = '' OR model_name = $3)
+		  AND ($4::bigint IS NULL OR key_id = $4)
+		GROUP BY minute, model_name
+		ORDER BY minute`, start, end, model, keyFilter)
 	if err != nil {
 		return nil, err
 	}
@@ -381,8 +465,10 @@ func (s *Store) ListMinuteUsage(ctx context.Context, start, end time.Time) ([]Mi
 	for rows.Next() {
 		var usage MinuteUsage
 		if err := rows.Scan(
-			&usage.Minute, &usage.Model, &usage.LongContext, &usage.Calls,
+			&usage.Minute, &usage.Model, &usage.Calls,
 			&usage.PromptTokens, &usage.CachedTokens, &usage.CompletionTokens,
+			&usage.LongContextPromptTokens, &usage.LongContextCachedTokens,
+			&usage.LongContextCompletionTokens,
 		); err != nil {
 			return nil, err
 		}
@@ -391,9 +477,52 @@ func (s *Store) ListMinuteUsage(ctx context.Context, start, end time.Time) ([]Mi
 	return out, rows.Err()
 }
 
+func (s *Store) ListUsageModels(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT model_name
+		FROM minute_usage_stats
+		WHERE model_name <> ''
+		ORDER BY model_name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	models := make([]string, 0)
+	for rows.Next() {
+		var model string
+		if err := rows.Scan(&model); err != nil {
+			return nil, err
+		}
+		models = append(models, model)
+	}
+	return models, rows.Err()
+}
+
+func (s *Store) ListUsageKeyOptions(ctx context.Context) ([]UsageKeyOption, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, name, prefix
+		FROM api_keys
+		ORDER BY id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	keys := make([]UsageKeyOption, 0)
+	for rows.Next() {
+		var key UsageKeyOption
+		if err := rows.Scan(&key.ID, &key.Name, &key.Prefix); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	return keys, rows.Err()
+}
+
 func (s *Store) ListCallLogs(ctx context.Context, limit, offset int) ([]CallLog, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT l.id, l.key_id, l.account_id, l.model, l.endpoint, l.status,
+		SELECT l.id, l.key_id, l.account_id, l.model, l.endpoint, l.status, l.error_reason,
 		       l.prompt_tokens, l.cached_tokens, l.completion_tokens,
 		       l.ttft_ms, l.latency_ms, l.stream, l.created_at, k.name, a.email
 		FROM call_logs l
@@ -409,7 +538,7 @@ func (s *Store) ListCallLogs(ctx context.Context, limit, offset int) ([]CallLog,
 	for rows.Next() {
 		var l CallLog
 		var model, endpoint, keyName, accountEmail *string
-		if err := rows.Scan(&l.ID, &l.KeyID, &l.AccountID, &model, &endpoint, &l.Status,
+		if err := rows.Scan(&l.ID, &l.KeyID, &l.AccountID, &model, &endpoint, &l.Status, &l.ErrorReason,
 			&l.PromptTokens, &l.CachedTokens, &l.CompletionTokens, &l.TTFTMs, &l.LatencyMs,
 			&l.Stream, &l.CreatedAt, &keyName, &accountEmail); err != nil {
 			return nil, err

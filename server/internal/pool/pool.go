@@ -12,20 +12,37 @@ import (
 	"grok2api/server/internal/store"
 )
 
+const (
+	StatusActive      = "active"
+	StatusCooldown    = "cooldown"
+	StatusExhausted   = "exhausted"
+	StatusNeedRelogin = "need_relogin"
+	StatusDisabled    = "disabled"
+)
+
 var (
 	ErrNoAccount       = errors.New("没有可用账号")
-	ErrAllCoolingDown  = errors.New("所有账号都在冷却中")
+	ErrAllCoolingDown  = errors.New("所有账号都在冷却或额度耗尽状态")
 	ErrAccountNotFound = errors.New("账号不存在或未启用")
 )
 
-type Account struct {
-	ID            int64
-	Email         string
+// AccountState 是调度器实际使用的运行状态，同时用于账号列表展示。
+type AccountState struct {
 	Status        string
-	RefreshToken  string // 解密后的明文
-	AccessToken   string
-	ExpiresAt     time.Time
-	CooldownUntil time.Time
+	CooldownUntil *time.Time
+	InFlight      int
+}
+
+type Account struct {
+	ID                  int64
+	Email               string
+	Status              string
+	RefreshToken        string // 解密后的明文
+	AccessToken         string
+	ExpiresAt           time.Time
+	CooldownUntil       time.Time
+	quotaExhaustedUntil time.Time // 上游明确返回额度耗尽后，至少保持到当前周限重置。
+	SchedulingDisabled  bool      // 人工调度开关；不影响在途请求和周用量刷新。
 
 	// Grok 订阅周用量（内存缓存，由 billing endpoint 定期刷新）。
 	BillingUsage billing.Usage
@@ -58,7 +75,7 @@ func (p *Pool) SetBillingClient(client *billing.Client) {
 	p.mu.Unlock()
 }
 
-// Reload 从数据库全量载入账号（仅 active 状态）。
+// Reload 从数据库全量载入凭据有效的账号，包括人工禁用账号。
 func (p *Pool) Reload(ctx context.Context) error {
 	recs, err := p.store.ListPoolAccounts(ctx)
 	if err != nil {
@@ -71,11 +88,15 @@ func (p *Pool) Reload(ctx context.Context) error {
 	now := time.Now()
 	for _, r := range recs {
 		a := &Account{
-			ID:            r.ID,
-			Email:         r.Email,
-			Status:        r.Status,
-			RefreshToken:  r.RefreshToken,
-			CooldownUntil: now,
+			ID:                 r.ID,
+			Email:              r.Email,
+			Status:             r.Status,
+			RefreshToken:       r.RefreshToken,
+			CooldownUntil:      now,
+			SchedulingDisabled: r.SchedulingDisabled,
+		}
+		if a.SchedulingDisabled {
+			a.Status = StatusDisabled
 		}
 		p.byID[r.ID] = a
 	}
@@ -89,25 +110,33 @@ func (p *Pool) AddAccount(id int64, email, refreshToken string) {
 		a.mu.Lock()
 		a.RefreshToken = refreshToken
 		a.Email = email
-		a.Status = "active"
+		a.Status = StatusActive
+		a.SchedulingDisabled = false
+		a.CooldownUntil = time.Time{}
+		a.quotaExhaustedUntil = time.Time{}
 		a.AccessToken = "" // 旧 access_token 作废
 		a.mu.Unlock()
 	} else {
 		p.byID[id] = &Account{
 			ID:            id,
 			Email:         email,
-			Status:        "active",
+			Status:        StatusActive,
 			RefreshToken:  refreshToken,
 			CooldownUntil: time.Now(),
 		}
 	}
 	p.mu.Unlock()
-	p.refreshBillingAsync(id)
+	p.RefreshBillingAsync(id)
 }
 
-// Acquire 选择一个未冷却且当前并发最少的账号。
+// Acquire 选择一个可用且当前并发最少的账号。
 // 账号不会被独占移出池，同一账号可以同时服务多个请求。
 func (p *Pool) Acquire() (*Account, error) {
+	return p.AcquireExcluding(nil)
+}
+
+// AcquireExcluding 为一次请求选择尚未尝试过的账号，避免故障转移又选回同一账号。
+func (p *Pool) AcquireExcluding(excluded map[int64]struct{}) (*Account, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.byID) == 0 {
@@ -117,7 +146,11 @@ func (p *Pool) Acquire() (*Account, error) {
 	now := time.Now()
 	var best *Account
 	for _, a := range p.byID {
-		if a.CooldownUntil.After(now) {
+		p.recalculateTimedStatusLocked(a, now)
+		if a.Status != StatusActive {
+			continue
+		}
+		if _, skip := excluded[a.ID]; skip {
 			continue
 		}
 		if best == nil || a.inFlight < best.inFlight ||
@@ -150,6 +183,134 @@ func (p *Pool) Release(a *Account, cooldownUntil time.Time) {
 	if cooldownUntil.After(a.CooldownUntil) {
 		a.CooldownUntil = cooldownUntil
 	}
+	p.recalculateTimedStatusLocked(a, time.Now())
+}
+
+// ReleaseQuotaExhausted 结束租用并记录上游明确返回的账号额度耗尽状态。
+// billing 百分比可能稍有延迟，因此周期刷新不能在 weekly_reset_at 前提前恢复该账号。
+func (p *Pool) ReleaseQuotaExhausted(a *Account) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	current, ok := p.byID[a.ID]
+	if !ok || current != a {
+		return
+	}
+	if a.inFlight > 0 {
+		a.inFlight--
+	}
+	now := time.Now()
+	until := now.Add(5 * time.Minute)
+	a.mu.Lock()
+	if a.BillingUsage.WeeklyResetAt.After(now) {
+		until = a.BillingUsage.WeeklyResetAt
+	}
+	a.mu.Unlock()
+	a.quotaExhaustedUntil = until
+	a.CooldownUntil = until
+	if a.SchedulingDisabled {
+		a.Status = StatusDisabled
+	} else {
+		a.Status = StatusExhausted
+	}
+}
+
+// AccountState 返回账号列表与调度器共用的实时状态。
+func (p *Pool) AccountState(id int64) (AccountState, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	a, ok := p.byID[id]
+	if !ok {
+		return AccountState{}, false
+	}
+	p.recalculateTimedStatusLocked(a, time.Now())
+	state := AccountState{Status: a.Status, InFlight: a.inFlight}
+	if a.Status == StatusCooldown || a.Status == StatusExhausted {
+		until := a.CooldownUntil
+		state.CooldownUntil = &until
+	}
+	return state, true
+}
+
+// RecalculateStatuses 根据最近一次成功周用量和冷却时间统一校准运行状态。
+func (p *Pool) RecalculateStatuses(now time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, a := range p.byID {
+		p.recalculateAccountStatusLocked(a, now)
+	}
+}
+
+func (p *Pool) recalculateTimedStatusLocked(a *Account, now time.Time) {
+	if a.SchedulingDisabled {
+		a.Status = StatusDisabled
+		return
+	}
+	if a.quotaExhaustedUntil.After(now) {
+		a.Status = StatusExhausted
+		a.CooldownUntil = a.quotaExhaustedUntil
+		return
+	}
+	if !a.quotaExhaustedUntil.IsZero() {
+		a.quotaExhaustedUntil = time.Time{}
+	}
+	if a.Status == StatusExhausted && a.CooldownUntil.After(now) {
+		return
+	}
+	if a.CooldownUntil.After(now) {
+		a.Status = StatusCooldown
+		return
+	}
+	a.CooldownUntil = time.Time{}
+	a.Status = StatusActive
+}
+
+func (p *Pool) recalculateAccountStatusLocked(a *Account, now time.Time) {
+	if a.SchedulingDisabled {
+		a.Status = StatusDisabled
+		return
+	}
+	if a.quotaExhaustedUntil.After(now) {
+		a.Status = StatusExhausted
+		a.CooldownUntil = a.quotaExhaustedUntil
+		return
+	}
+	if !a.quotaExhaustedUntil.IsZero() {
+		a.quotaExhaustedUntil = time.Time{}
+	}
+
+	a.mu.Lock()
+	usage := a.BillingUsage
+	a.mu.Unlock()
+
+	wasExhausted := a.Status == StatusExhausted
+	if !usage.UpdatedAt.IsZero() && usage.WeeklyUsedPercent >= 99 && usage.WeeklyResetAt.After(now) {
+		a.Status = StatusExhausted
+		a.CooldownUntil = usage.WeeklyResetAt
+		return
+	}
+	if wasExhausted {
+		// 周期已重置，或刷新后确认额度恢复；清除原来的周限截止时间。
+		a.CooldownUntil = time.Time{}
+	}
+	if a.CooldownUntil.After(now) {
+		a.Status = StatusCooldown
+		return
+	}
+	a.CooldownUntil = time.Time{}
+	a.Status = StatusActive
+}
+
+// SetSchedulingDisabled 设置人工调度开关。禁用不影响已经分配的在途请求。
+func (p *Pool) SetSchedulingDisabled(id int64, disabled bool) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	a, ok := p.byID[id]
+	if !ok {
+		return false
+	}
+	a.SchedulingDisabled = disabled
+	p.recalculateAccountStatusLocked(a, time.Now())
+	return true
 }
 
 // Remove 从池中移除账号。
@@ -166,9 +327,11 @@ func (a *Account) Invalidate() {
 	a.mu.Unlock()
 }
 
-// MarkNeedRelogin 标记需要重新授权并移除。
+// MarkNeedRelogin 标记需要重新授权并移出运行池。
 func (p *Pool) MarkNeedRelogin(ctx context.Context, a *Account) {
-	_ = p.store.SetAccountStatus(ctx, a.ID, "need_relogin")
+	if err := p.store.SetAccountStatus(ctx, a.ID, StatusNeedRelogin); err != nil {
+		log.Printf("标记账号 %d 需要重新授权失败: %v", a.ID, err)
+	}
 	p.Remove(a.ID)
 }
 
@@ -210,7 +373,7 @@ func (p *Pool) Len() int {
 	return len(p.byID)
 }
 
-// RefreshBilling 刷新所有账号的订阅等级、周用量和重置时间。
+// RefreshBilling 刷新所有账号的订阅等级、周用量和重置时间，并重新计算运行状态。
 func (p *Pool) RefreshBilling(ctx context.Context) {
 	p.mu.Lock()
 	ids := make([]int64, 0, len(p.byID))
@@ -230,6 +393,7 @@ func (p *Pool) RefreshBilling(ctx context.Context) {
 		}()
 	}
 	wg.Wait()
+	p.RecalculateStatuses(time.Now())
 }
 
 // BillingUsage 返回账号最近一次成功获取的真实订阅周用量。
@@ -291,10 +455,20 @@ func (p *Pool) RedeemReset(ctx context.Context, id int64) (billing.Usage, error)
 			remaining = append(remaining, candidate)
 		}
 	}
+	now = time.Now()
 	a.mu.Lock()
+	a.BillingUsage.WeeklyUsedPercent = 0
+	a.BillingUsage.UpdatedAt = now
 	a.BillingUsage.ResetCredits = remaining
-	a.BillingUsage.ResetCreditsUpdatedAt = time.Now()
+	a.BillingUsage.ResetCreditsUpdatedAt = now
 	a.mu.Unlock()
+	p.mu.Lock()
+	if current, ok := p.byID[a.ID]; ok && current == a {
+		a.CooldownUntil = time.Time{}
+		a.quotaExhaustedUntil = time.Time{}
+		p.recalculateAccountStatusLocked(a, time.Now())
+	}
+	p.mu.Unlock()
 
 	if refreshed, refreshErr := client.Fetch(ctx, accessToken); refreshErr == nil {
 		if refreshed.ResetCreditsUpdatedAt.IsZero() {
@@ -320,7 +494,8 @@ func (p *Pool) RedeemReset(ctx context.Context, id int64) (billing.Usage, error)
 	return usage, nil
 }
 
-func (p *Pool) refreshBillingAsync(id int64) {
+// RefreshBillingAsync 在 429 或新增账号后立即异步校准该账号的周用量状态。
+func (p *Pool) RefreshBillingAsync(id int64) {
 	p.mu.Lock()
 	enabled := p.billing != nil
 	p.mu.Unlock()
@@ -346,6 +521,9 @@ func (p *Pool) refreshBillingAccount(ctx context.Context, id int64) error {
 	}
 	accessToken, err := p.Token(ctx, a)
 	if err != nil {
+		if errors.Is(err, oauth.ErrInvalidGrant) {
+			p.MarkNeedRelogin(ctx, a)
+		}
 		return err
 	}
 	usage, err := client.Fetch(ctx, accessToken)
@@ -355,6 +533,11 @@ func (p *Pool) refreshBillingAccount(ctx context.Context, id int64) error {
 	a.mu.Lock()
 	mergeBillingUsage(a, usage)
 	a.mu.Unlock()
+	p.mu.Lock()
+	if current, ok := p.byID[id]; ok && current == a {
+		p.recalculateAccountStatusLocked(a, time.Now())
+	}
+	p.mu.Unlock()
 	return nil
 }
 

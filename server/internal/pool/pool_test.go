@@ -73,6 +73,27 @@ func TestAcquirePrefersLeastInFlightAndRotatesTies(t *testing.T) {
 	p.Release(a3, time.Now())
 }
 
+func TestAcquireExcludingSelectsDifferentAccount(t *testing.T) {
+	p := New(nil, nil)
+	p.AddAccount(1, "a@x.com", "rt1")
+	p.AddAccount(2, "b@x.com", "rt2")
+
+	first, err := p.AcquireExcluding(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Release(first, time.Now())
+
+	second, err := p.AcquireExcluding(map[int64]struct{}{first.ID: {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Release(second, time.Now())
+	if second.ID == first.ID {
+		t.Fatalf("故障转移重复选择了账号 %d", first.ID)
+	}
+}
+
 func TestConcurrentReleaseDoesNotClearCooldown(t *testing.T) {
 	p := New(nil, nil)
 	p.AddAccount(1, "a@x.com", "rt1")
@@ -98,6 +119,115 @@ func TestConcurrentReleaseDoesNotClearCooldown(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.Release(a3, time.Now())
+}
+
+func TestRuntimeStatusCooldownExpiresToActive(t *testing.T) {
+	p := New(nil, nil)
+	p.AddAccount(1, "a@x.com", "rt1")
+	a, _ := p.Acquire()
+	now := time.Now()
+	cooldownUntil := now.Add(time.Minute)
+	p.Release(a, cooldownUntil)
+
+	state, ok := p.AccountState(1)
+	if !ok || state.Status != StatusCooldown || state.CooldownUntil == nil || !state.CooldownUntil.Equal(cooldownUntil) {
+		t.Fatalf("cooldown state = %+v, ok = %t", state, ok)
+	}
+	p.RecalculateStatuses(cooldownUntil.Add(time.Second))
+	state, _ = p.AccountState(1)
+	if state.Status != StatusActive || state.CooldownUntil != nil {
+		t.Fatalf("expired cooldown state = %+v", state)
+	}
+}
+
+func TestRuntimeStatusExhaustedRecoversAfterBillingRefresh(t *testing.T) {
+	p := New(nil, nil)
+	p.AddAccount(1, "a@x.com", "rt1")
+	a := p.byID[1]
+	now := time.Now()
+	resetAt := now.Add(7 * 24 * time.Hour)
+
+	a.mu.Lock()
+	a.BillingUsage = billing.Usage{
+		WeeklyUsedPercent: 99,
+		WeeklyResetAt:     resetAt,
+		UpdatedAt:         now,
+	}
+	a.mu.Unlock()
+	p.RecalculateStatuses(now)
+
+	state, _ := p.AccountState(1)
+	if state.Status != StatusExhausted || state.CooldownUntil == nil || !state.CooldownUntil.Equal(resetAt) {
+		t.Fatalf("exhausted state = %+v", state)
+	}
+	if _, err := p.Acquire(); !errors.Is(err, ErrAllCoolingDown) {
+		t.Fatalf("Acquire error = %v, want ErrAllCoolingDown", err)
+	}
+
+	a.mu.Lock()
+	a.BillingUsage.WeeklyUsedPercent = 25
+	a.BillingUsage.UpdatedAt = now.Add(time.Minute)
+	a.mu.Unlock()
+	p.RecalculateStatuses(now.Add(time.Minute))
+	state, _ = p.AccountState(1)
+	if state.Status != StatusActive || state.CooldownUntil != nil {
+		t.Fatalf("recovered state = %+v", state)
+	}
+}
+
+func TestExplicitQuotaExhaustionSurvivesLowerBillingPercentage(t *testing.T) {
+	p := New(nil, nil)
+	p.AddAccount(1, "a@x.com", "rt1")
+	a := p.byID[1]
+	now := time.Now()
+	resetAt := now.Add(48 * time.Hour)
+	a.mu.Lock()
+	a.BillingUsage = billing.Usage{
+		WeeklyUsedPercent: 98,
+		WeeklyResetAt:     resetAt,
+		UpdatedAt:         now,
+	}
+	a.mu.Unlock()
+
+	leased, err := p.Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.ReleaseQuotaExhausted(leased)
+	p.RecalculateStatuses(now.Add(time.Minute))
+
+	state, _ := p.AccountState(1)
+	if state.Status != StatusExhausted || state.CooldownUntil == nil || !state.CooldownUntil.Equal(resetAt) {
+		t.Fatalf("state = %+v", state)
+	}
+	if _, err := p.Acquire(); !errors.Is(err, ErrAllCoolingDown) {
+		t.Fatalf("Acquire error = %v, want ErrAllCoolingDown", err)
+	}
+}
+
+func TestRuntimeStatusExhaustedExpiresAtWeeklyReset(t *testing.T) {
+	p := New(nil, nil)
+	p.AddAccount(1, "a@x.com", "rt1")
+	a := p.byID[1]
+	now := time.Now()
+
+	a.mu.Lock()
+	a.BillingUsage = billing.Usage{
+		WeeklyUsedPercent: 100,
+		WeeklyResetAt:     now.Add(time.Minute),
+		UpdatedAt:         now,
+	}
+	a.mu.Unlock()
+	p.RecalculateStatuses(now)
+	a.mu.Lock()
+	a.BillingUsage.WeeklyResetAt = now.Add(-time.Minute)
+	a.mu.Unlock()
+	p.RecalculateStatuses(now)
+
+	state, _ := p.AccountState(1)
+	if state.Status != StatusActive || state.CooldownUntil != nil {
+		t.Fatalf("state after weekly reset = %+v", state)
+	}
 }
 
 func TestAcquireBalancesConcurrentLoad(t *testing.T) {
@@ -156,6 +286,46 @@ func TestRefreshBillingCachesLatestSuccessfulUsage(t *testing.T) {
 	preserved, ok := p.BillingUsage(1)
 	if !ok || !reflect.DeepEqual(preserved, usage) {
 		t.Fatalf("failed refresh replaced usage: before=%+v after=%+v", usage, preserved)
+	}
+}
+
+func TestRefreshBillingRecoversExhaustedAccountWhenUsageIsOmitted(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/billing":
+			_, _ = w.Write([]byte(`{"config":{"isUnifiedBillingUser":true,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-08-31T08:12:21Z"}}}`))
+		case "/settings":
+			_, _ = w.Write([]byte(`{"subscription_tier_display":"SuperGrok Heavy"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	p := New(nil, nil)
+	p.AddAccount(1, "a@x.com", "refresh")
+	a := p.byID[1]
+	a.AccessToken = "access"
+	a.ExpiresAt = time.Now().Add(time.Hour)
+	a.mu.Lock()
+	a.BillingUsage = billing.Usage{
+		WeeklyUsedPercent: 99,
+		WeeklyResetAt:     time.Now().Add(7 * 24 * time.Hour),
+		UpdatedAt:         time.Now(),
+	}
+	a.mu.Unlock()
+	p.RecalculateStatuses(time.Now())
+	p.SetBillingClient(billing.New(server.URL, server.URL))
+
+	p.RefreshBilling(context.Background())
+
+	usage, ok := p.BillingUsage(1)
+	if !ok || usage.WeeklyUsedPercent != 0 {
+		t.Fatalf("usage = %+v, ok = %t", usage, ok)
+	}
+	state, _ := p.AccountState(1)
+	if state.Status != StatusActive || state.CooldownUntil != nil {
+		t.Fatalf("state = %+v, want active", state)
 	}
 }
 
@@ -253,6 +423,92 @@ func TestRedeemResetUsesSoonestCreditAndRefreshesUsage(t *testing.T) {
 	}
 	if !redeemed.Load() || usage.WeeklyUsedPercent != 0 || len(usage.AvailableResetCredits(time.Now())) != 0 {
 		t.Fatalf("usage after redeem = %+v, redeemed = %t", usage, redeemed.Load())
+	}
+}
+
+func TestSchedulingDisabledStopsNewAssignmentsWithoutInterruptingInFlight(t *testing.T) {
+	p := New(nil, nil)
+	p.AddAccount(1, "a", "rt1")
+	p.AddAccount(2, "b", "rt2")
+
+	inFlight, err := p.Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.SetSchedulingDisabled(inFlight.ID, true) {
+		t.Fatal("failed to disable existing account")
+	}
+	state, ok := p.AccountState(inFlight.ID)
+	if !ok || state.Status != StatusDisabled || state.InFlight != 1 {
+		t.Fatalf("disabled in-flight state = %+v, ok=%t", state, ok)
+	}
+
+	next, err := p.Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.ID == inFlight.ID {
+		t.Fatal("disabled account received a new assignment")
+	}
+	p.Release(next, time.Now())
+	p.Release(inFlight, time.Now())
+	state, _ = p.AccountState(inFlight.ID)
+	if state.Status != StatusDisabled || state.InFlight != 0 {
+		t.Fatalf("released disabled state = %+v", state)
+	}
+
+	if !p.SetSchedulingDisabled(inFlight.ID, false) {
+		t.Fatal("failed to enable existing account")
+	}
+	state, _ = p.AccountState(inFlight.ID)
+	if state.Status != StatusActive {
+		t.Fatalf("enabled state = %+v, want active", state)
+	}
+}
+
+func TestQuotaFailureDoesNotOverrideManualDisabledState(t *testing.T) {
+	p := New(nil, nil)
+	p.AddAccount(1, "a", "rt")
+	a, err := p.Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.SetSchedulingDisabled(1, true)
+	p.ReleaseQuotaExhausted(a)
+	state, _ := p.AccountState(1)
+	if state.Status != StatusDisabled || state.InFlight != 0 {
+		t.Fatalf("quota failure overrode disabled state: %+v", state)
+	}
+}
+
+func TestReauthorizationClearsManualDisabledState(t *testing.T) {
+	p := New(nil, nil)
+	p.AddAccount(1, "a", "old")
+	p.SetSchedulingDisabled(1, true)
+	p.AddAccount(1, "a", "new")
+	state, _ := p.AccountState(1)
+	if state.Status != StatusActive || p.byID[1].SchedulingDisabled {
+		t.Fatalf("reauthorized state = %+v disabled=%t", state, p.byID[1].SchedulingDisabled)
+	}
+}
+
+func TestEnablingAccountRecalculatesQuotaState(t *testing.T) {
+	p := New(nil, nil)
+	p.AddAccount(1, "a", "rt")
+	a := p.byID[1]
+	a.mu.Lock()
+	a.BillingUsage = billing.Usage{
+		WeeklyUsedPercent: 100,
+		WeeklyResetAt:     time.Now().Add(time.Hour),
+		UpdatedAt:         time.Now(),
+	}
+	a.mu.Unlock()
+
+	p.SetSchedulingDisabled(1, true)
+	p.SetSchedulingDisabled(1, false)
+	state, _ := p.AccountState(1)
+	if state.Status != StatusExhausted || state.CooldownUntil == nil {
+		t.Fatalf("enabled quota state = %+v, want exhausted", state)
 	}
 }
 

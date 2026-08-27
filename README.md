@@ -127,15 +127,17 @@ client.messages.create(model="grok-4.6", max_tokens=1024, messages=[{"role":"use
 
 ## 实现要点
 
-- **账号池**：上千账号常驻内存，优先调度未冷却且当前并发最少的账号；同一账号可并发，上游 429 自动冷却换号，401 刷新 token 重试，刷新失败标记 `need_relogin`。
+- **账号池**：账号统一使用 `active`、`cooldown`、`exhausted`、`need_relogin` 运行状态；只调度 `active` 且当前并发最少的账号，同一请求故障转移时不会重复选号，同一账号仍可并发。
+- **自动换号**：上游 429 或 response 明确返回 `spending-limit` 时立即冷却/标记额度耗尽并换号；401 刷新 token 后在原账号重试一次，仍失败则标记 `need_relogin` 并换号；TTS/STT 使用相同规则。
 - **Token 管理**：refresh_token 用 AES-GCM 加密落库，access_token 内存缓存，到期自动刷新。
-- **订阅周用量**：通过 Grok CLI billing/settings endpoint 获取会员等级、周用量百分比和重置时间，启动时及每 5 分钟刷新并缓存。
+- **订阅周用量**：通过 Grok CLI billing/settings endpoint 获取会员等级、周用量百分比和重置时间；启动时及每 5 分钟刷新并重新计算账号状态，已用达到 99% 的账号保持 `exhausted` 到周限重置。
 - **周限重置**：通过 Grok 主站 `GetRemainingResets` 查询可用重置机会；账号列表可在二次确认后调用 `RedeemReset`，三天内过期的机会会高亮提示。券 ID 仅保存在服务内存中。
 - **透传**：流式 SSE 原样转发；TTS/STT 做字段映射（OpenAI 格式 ↔ xAI 格式）。
 - **Tool 兼容**：自动清理 `required: null`，将函数参数根级 nullable/非 object 联合类型收窄为 object，并双向转换 OpenAI Responses namespace function 工具。
 - **多 Key**：下游 Key 哈希存储，支持 `Authorization: Bearer` 和 `x-api-key`。
-- **调用记录分区**：PostgreSQL 按 Asia/Shanghai 自然日写入 `call_logs_YYYYMMDD`，应用自动预建未来 7 天分区；记录输入/缓存命中/输出 Token、首字延迟、总耗时及流式标记。
-- **分钟级仪表盘**：按 Asia/Shanghai 分钟聚合调用次数、输入 Token 和估算费用；缓存输入、输出及超过 20 万 Token 的长上下文分别按 xAI 官方模型费率计价。
+- **调用记录分区**：PostgreSQL 按 Asia/Shanghai 自然日写入 `call_logs_YYYYMMDD`，应用自动预建未来 7 天分区；记录输入/缓存命中/输出 Token、首字延迟、总耗时、流式标记及从 response 提取的脱敏错误分类。
+- **分钟统计表**：写调用记录时同步按“分钟 + Key + 模型”原子累加 `minute_usage_stats`，迁移会一次性回填历史日志；Dashboard 不再扫描原始调用记录。
+- **分钟级仪表盘**：按 Asia/Shanghai 展示调用次数、输入 Token 和估算费用；缓存输入、输出及超过 20 万 Token 的长上下文分别按 xAI 官方模型费率计价。
 
 ## 当前阶段范围
 

@@ -6,6 +6,65 @@ import (
 	"testing"
 )
 
+func TestNormalizeAnthropicToolChoiceDisablesToolsForNone(t *testing.T) {
+	t.Parallel()
+
+	for _, body := range [][]byte{
+		[]byte(`{"tool_choice":{"type":"none"},"tools":[{"name":"lookup","input_schema":{"type":"object"}}]}`),
+		[]byte(`{"tool_choice":"none","tools":[{"name":"lookup","input_schema":{"type":"object"}}]}`),
+	} {
+		normalized, changed := normalizeAnthropicToolChoice(body)
+		if !changed {
+			t.Fatalf("expected none to be normalized: %s", body)
+		}
+		payload := decodeMessagePayload(t, normalized)
+		if _, exists := payload["tool_choice"]; exists {
+			t.Fatalf("tool_choice retained: %s", normalized)
+		}
+		if _, exists := payload["tools"]; exists {
+			t.Fatalf("tools retained when disabled: %s", normalized)
+		}
+	}
+}
+
+func TestNormalizeAnthropicToolChoiceConvertsOpenAIVariants(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		body     string
+		wantType string
+		wantName string
+	}{
+		{`{"tool_choice":"auto"}`, "auto", ""},
+		{`{"tool_choice":{"type":"required","disable_parallel_tool_use":true}}`, "any", ""},
+		{`{"tool_choice":{"type":"function","name":"lookup"}}`, "tool", "lookup"},
+		{`{"tool_choice":{"type":"function","function":{"name":"search"}}}`, "tool", "search"},
+	}
+	for _, test := range tests {
+		normalized, changed := normalizeAnthropicToolChoice([]byte(test.body))
+		if !changed {
+			t.Fatalf("expected tool choice to be normalized: %s", test.body)
+		}
+		choice := decodeMessagePayload(t, normalized)["tool_choice"].(map[string]any)
+		if choice["type"] != test.wantType {
+			t.Fatalf("body=%s type=%v, want %s", test.body, choice["type"], test.wantType)
+		}
+		if test.wantName != "" && choice["name"] != test.wantName {
+			t.Fatalf("body=%s name=%v, want %s", test.body, choice["name"], test.wantName)
+		}
+	}
+}
+
+func TestNormalizeAnthropicToolChoiceLeavesValidChoiceUntouched(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"tool_choice":{"type":"auto"},"tools":[{"name":"lookup"}]}`)
+	normalized, changed := normalizeAnthropicToolChoice(body)
+	if changed || !bytes.Equal(normalized, body) {
+		t.Fatalf("valid choice changed: %s", normalized)
+	}
+}
+
 func TestNormalizeAnthropicMessageRolesPromotesSystemAndDeveloper(t *testing.T) {
 	t.Parallel()
 

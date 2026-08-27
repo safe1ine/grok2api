@@ -1,0 +1,2 @@
+ALTER TABLE call_logs
+    ADD COLUMN IF NOT EXISTS error_reason TEXT NOT NULL DEFAULT '';
