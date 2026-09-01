@@ -421,6 +421,135 @@ func TestStreamCopyRenumbersRepeatedAnthropicIndexes(t *testing.T) {
 	}
 }
 
+func TestStreamCopySplitsMergedAnthropicToolCalls(t *testing.T) {
+	t.Parallel()
+
+	input := "event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}` + "\n\n" +
+		"event: content_block_stop\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+		"event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+		"event: content_block_stop\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+		"event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"bash","input":{}}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"pwd\"}"}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"id\"}"}}` + "\n\n" +
+		"event: content_block_stop\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n"
+
+	recorder := httptest.NewRecorder()
+	streamCopyWithCompatibility(
+		recorder, strings.NewReader(input), "text/event-stream", nil, time.Now(),
+		streamCompatibilityOptions{fillAnthropicIndexes: true},
+	)
+	payloads := decodeSSEPayloads(t, recorder.Body.String())
+	if len(payloads) != 10 {
+		t.Fatalf("payload count = %d, output = %s", len(payloads), recorder.Body.String())
+	}
+	for i, want := range []int{0, 0, 1, 1, 2, 2, 2, 3, 3, 3} {
+		assertSSEIndex(t, payloads[i], want)
+	}
+	firstDelta := payloads[5]["delta"].(map[string]any)
+	secondBlock := payloads[7]["content_block"].(map[string]any)
+	secondDelta := payloads[8]["delta"].(map[string]any)
+	if firstDelta["partial_json"] != `{"command":"pwd"}` {
+		t.Fatalf("first arguments = %v", firstDelta["partial_json"])
+	}
+	if secondBlock["id"] != "call_1-split-1" || secondBlock["name"] != "bash" {
+		t.Fatalf("second tool block = %#v", secondBlock)
+	}
+	if secondDelta["partial_json"] != `{"command":"id"}` {
+		t.Fatalf("second arguments = %v", secondDelta["partial_json"])
+	}
+	output := recorder.Body.String()
+	for _, eventType := range []string{"content_block_stop", "content_block_start", "content_block_delta"} {
+		if !strings.Contains(output, "event: "+eventType) {
+			t.Fatalf("missing event label %s: %s", eventType, output)
+		}
+	}
+}
+
+func TestStreamCopyKeepsFragmentedAnthropicToolInputTogether(t *testing.T) {
+	t.Parallel()
+
+	input := "event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"bash","input":{}}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"pwd\"}"}}` + "\n\n" +
+		"event: content_block_stop\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n"
+
+	recorder := httptest.NewRecorder()
+	streamCopyWithCompatibility(
+		recorder, strings.NewReader(input), "text/event-stream", nil, time.Now(),
+		streamCompatibilityOptions{fillAnthropicIndexes: true},
+	)
+	payloads := decodeSSEPayloads(t, recorder.Body.String())
+	if len(payloads) != 4 {
+		t.Fatalf("payload count = %d, output = %s", len(payloads), recorder.Body.String())
+	}
+	for _, payload := range payloads {
+		assertSSEIndex(t, payload, 0)
+	}
+	first := payloads[1]["delta"].(map[string]any)["partial_json"].(string)
+	second := payloads[2]["delta"].(map[string]any)["partial_json"].(string)
+	if first+second != `{"command":"pwd"}` {
+		t.Fatalf("arguments = %q", first+second)
+	}
+}
+
+func TestStreamCopyNormalizesAnthropicUsageWithoutChangingMetrics(t *testing.T) {
+	t.Parallel()
+
+	input := "event: message_start\n" +
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":4497,"cache_creation_input_tokens":0,"cache_read_input_tokens":4352,"output_tokens":0}}}` + "\n\n" +
+		"event: message_delta\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":187}}` + "\n\n"
+
+	recorder := httptest.NewRecorder()
+	metrics := streamCopyWithCompatibility(
+		recorder, strings.NewReader(input), "text/event-stream", nil, time.Now(),
+		streamCompatibilityOptions{normalizeAnthropicUsage: true},
+	)
+	payloads := decodeSSEPayloads(t, recorder.Body.String())
+	message := payloads[0]["message"].(map[string]any)
+	usage := message["usage"].(map[string]any)
+	if inputTokens, ok := tokenCount(usage["input_tokens"]); !ok || inputTokens != 145 {
+		t.Fatalf("forwarded usage = %#v", usage)
+	}
+	if metrics.InputTokens != 4497 || metrics.CachedInputTokens != 4352 || metrics.OutputTokens != 187 {
+		t.Fatalf("internal metrics = %+v", metrics)
+	}
+}
+
+func TestNonStreamCopyNormalizesAnthropicCacheCreationUsage(t *testing.T) {
+	t.Parallel()
+
+	input := `{"type":"message","usage":{"input_tokens":100,"cache_creation_input_tokens":20,"cache_read_input_tokens":60,"output_tokens":10}}`
+	recorder := httptest.NewRecorder()
+	metrics := streamCopyWithCompatibility(
+		recorder, strings.NewReader(input), "application/json", nil, time.Now(),
+		streamCompatibilityOptions{normalizeAnthropicUsage: true},
+	)
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	usage := payload["usage"].(map[string]any)
+	if usage["input_tokens"] != float64(20) {
+		t.Fatalf("forwarded usage = %#v", usage)
+	}
+	if metrics.InputTokens != 100 || metrics.CachedInputTokens != 60 || metrics.OutputTokens != 10 {
+		t.Fatalf("internal metrics = %+v", metrics)
+	}
+}
+
 func TestStreamCopyDoesNotFillAnthropicIndexesByDefault(t *testing.T) {
 	t.Parallel()
 

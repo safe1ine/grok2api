@@ -295,7 +295,10 @@ accountsLoop:
 			finalStatus = resp.StatusCode
 			responseStats := streamCopyWithCompatibility(
 				w, resp.Body, resp.Header.Get("Content-Type"), namespaceMappings, start,
-				streamCompatibilityOptions{fillAnthropicIndexes: r.URL.Path == "/v1/messages"},
+				streamCompatibilityOptions{
+					fillAnthropicIndexes:    r.URL.Path == "/v1/messages",
+					normalizeAnthropicUsage: r.URL.Path == "/v1/messages",
+				},
 			)
 			responseStats.Stream = metrics.Stream
 			metrics = responseStats

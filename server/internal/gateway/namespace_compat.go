@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -623,8 +624,158 @@ func formatSSEPayloads(payloads [][]byte, lineEnding string) string {
 	return output.String()
 }
 
+type anthropicMergedToolStreamState struct {
+	contentBlock map[string]any
+	originalID   string
+	arguments    string
+	splitCount   int
+}
+
+// splitMergedCalls repairs xAI streams that emit multiple complete tool inputs as
+// deltas of one Anthropic tool_use block. Each input must be a separate content block.
+func (s *anthropicMergedToolStreamState) splitMergedCalls(payload []byte) ([][]byte, bool) {
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.UseNumber()
+	var event map[string]any
+	if err := dec.Decode(&event); err != nil {
+		return [][]byte{payload}, false
+	}
+
+	eventType, _ := event["type"].(string)
+	switch eventType {
+	case "content_block_start":
+		block, _ := event["content_block"].(map[string]any)
+		if block == nil || block["type"] != "tool_use" {
+			s.contentBlock = nil
+			return [][]byte{payload}, false
+		}
+		s.contentBlock = cloneSchemaValue(block).(map[string]any)
+		s.originalID, _ = block["id"].(string)
+		s.arguments = ""
+		s.splitCount = 0
+	case "content_block_delta":
+		if s.contentBlock == nil {
+			return [][]byte{payload}, false
+		}
+		delta, _ := event["delta"].(map[string]any)
+		if delta == nil || delta["type"] != "input_json_delta" {
+			return [][]byte{payload}, false
+		}
+		fragment, _ := delta["partial_json"].(string)
+		if !completeJSONObject(s.arguments) || !strings.HasPrefix(strings.TrimSpace(fragment), "{") {
+			s.arguments += fragment
+			return [][]byte{payload}, false
+		}
+
+		s.splitCount++
+		stopEvent := map[string]any{"type": "content_block_stop"}
+		block := cloneSchemaValue(s.contentBlock).(map[string]any)
+		block["id"] = fmt.Sprintf("%s-split-%d", s.originalID, s.splitCount)
+		block["input"] = map[string]any{}
+		startEvent := map[string]any{"type": "content_block_start", "content_block": block}
+		deltaEvent := cloneSchemaValue(event).(map[string]any)
+		delete(deltaEvent, "index")
+		s.arguments = fragment
+		s.contentBlock = block
+
+		stopPayload, _ := json.Marshal(stopEvent)
+		startPayload, _ := json.Marshal(startEvent)
+		deltaPayload, _ := json.Marshal(deltaEvent)
+		return [][]byte{stopPayload, startPayload, deltaPayload}, true
+	case "content_block_stop":
+		s.contentBlock = nil
+		s.originalID = ""
+		s.arguments = ""
+		s.splitCount = 0
+	}
+	return [][]byte{payload}, false
+}
+
+func completeJSONObject(value string) bool {
+	var object map[string]any
+	return strings.TrimSpace(value) != "" && json.Unmarshal([]byte(value), &object) == nil
+}
+
+func formatAnthropicSSEPayloads(payloads [][]byte, lineEnding string) string {
+	if lineEnding == "" {
+		lineEnding = "\n"
+	}
+	var output strings.Builder
+	for _, payload := range payloads {
+		var event struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(payload, &event)
+		if event.Type != "" {
+			output.WriteString("event: ")
+			output.WriteString(event.Type)
+			output.WriteString(lineEnding)
+		}
+		output.WriteString("data: ")
+		output.Write(payload)
+		output.WriteString(lineEnding)
+		output.WriteString(lineEnding)
+	}
+	return output.String()
+}
+
 type streamCompatibilityOptions struct {
-	fillAnthropicIndexes bool
+	fillAnthropicIndexes    bool
+	normalizeAnthropicUsage bool
+}
+
+func normalizeXAIAnthropicUsage(data []byte) ([]byte, bool) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var payload any
+	if err := dec.Decode(&payload); err != nil || !normalizeAnthropicUsageValue(payload) {
+		return data, false
+	}
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return data, false
+	}
+	return rewritten, true
+}
+
+func normalizeAnthropicUsageValue(value any) bool {
+	changed := false
+	switch value := value.(type) {
+	case map[string]any:
+		for key, child := range value {
+			if key == "usage" {
+				if usage, ok := child.(map[string]any); ok && normalizeAnthropicUsageObject(usage) {
+					changed = true
+				}
+				continue
+			}
+			if normalizeAnthropicUsageValue(child) {
+				changed = true
+			}
+		}
+	case []any:
+		for _, child := range value {
+			if normalizeAnthropicUsageValue(child) {
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+func normalizeAnthropicUsageObject(usage map[string]any) bool {
+	input, inputSeen := firstTokenCountPresent(usage, "input_tokens")
+	if !inputSeen {
+		return false
+	}
+	cacheRead := firstTokenCount(usage, "cache_read_input_tokens")
+	cacheCreation := firstTokenCount(usage, "cache_creation_input_tokens")
+	uncachedInput := maxInt(0, input-cacheRead-cacheCreation)
+	if uncachedInput == input {
+		return false
+	}
+	usage["input_tokens"] = uncachedInput
+	return true
 }
 
 func streamCopyWithNamespaceMappings(
@@ -652,6 +803,11 @@ func streamCopyWithCompatibility(
 	metrics := responseMetrics{}
 	data := readAllWithMetrics(body, &metrics, start)
 	observeResponsePayload(data, &metrics, start)
+	if options.normalizeAnthropicUsage {
+		if rewritten, changed := normalizeXAIAnthropicUsage(data); changed {
+			data = rewritten
+		}
+	}
 	if rewritten, changed := rewriteNamespaceToolCalls(data, mappings); changed {
 		data = rewritten
 	}
@@ -671,6 +827,7 @@ func streamCopyNamespaceSSE(
 	reader := bufio.NewReaderSize(body, 32*1024)
 	flusher, canFlush := w.(http.Flusher)
 	indexState := anthropicStreamIndexState{}
+	anthropicToolState := anthropicMergedToolStreamState{}
 	customState := customToolStreamState{}
 	downstreamWritable := true
 	for {
@@ -697,20 +854,36 @@ func streamCopyNamespaceSSE(
 					output = formatSSEPayloads(customPayloads, lineEnding)
 					payload = nil
 				}
-				changed := false
-				if payload != nil && options.fillAnthropicIndexes {
-					if rewritten, indexChanged := indexState.fillMissingIndex(payload); indexChanged {
-						payload = rewritten
-						changed = true
-					}
-				}
 				if payload != nil {
-					if rewritten, namespaceChanged := rewriteNamespaceToolCalls(payload, mappings); namespaceChanged {
-						payload = rewritten
-						changed = true
+					payloads := [][]byte{payload}
+					expanded := false
+					if options.fillAnthropicIndexes {
+						payloads, expanded = anthropicToolState.splitMergedCalls(payload)
 					}
-					if changed {
-						output = "data: " + string(payload) + lineEnding
+					changed := false
+					for index, current := range payloads {
+						if options.fillAnthropicIndexes {
+							if rewritten, indexChanged := indexState.fillMissingIndex(current); indexChanged {
+								current = rewritten
+								changed = true
+							}
+						}
+						if options.normalizeAnthropicUsage {
+							if rewritten, usageChanged := normalizeXAIAnthropicUsage(current); usageChanged {
+								current = rewritten
+								changed = true
+							}
+						}
+						if rewritten, namespaceChanged := rewriteNamespaceToolCalls(current, mappings); namespaceChanged {
+							current = rewritten
+							changed = true
+						}
+						payloads[index] = current
+					}
+					if expanded {
+						output = formatAnthropicSSEPayloads(payloads, lineEnding)
+					} else if changed {
+						output = "data: " + string(payloads[0]) + lineEnding
 					}
 				}
 			}
