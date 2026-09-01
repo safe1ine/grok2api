@@ -385,6 +385,42 @@ func TestStreamCopyFillsMissingAnthropicIndexes(t *testing.T) {
 	assertNoSSEIndex(t, payloads[7])
 }
 
+func TestStreamCopyRenumbersRepeatedAnthropicIndexes(t *testing.T) {
+	t.Parallel()
+
+	input := "event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"one"}}` + "\n\n" +
+		"event: content_block_stop\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+		"event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"lookup","input":{}}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}` + "\n\n" +
+		"event: content_block_stop\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+		"event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_2","name":"search","input":{}}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}` + "\n\n" +
+		"event: content_block_stop\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n"
+
+	recorder := httptest.NewRecorder()
+	streamCopyWithCompatibility(
+		recorder, strings.NewReader(input), "text/event-stream", nil, time.Now(),
+		streamCompatibilityOptions{fillAnthropicIndexes: true},
+	)
+	payloads := decodeSSEPayloads(t, recorder.Body.String())
+	if len(payloads) != 9 {
+		t.Fatalf("payload count = %d, output = %s", len(payloads), recorder.Body.String())
+	}
+	for i, want := range []int{0, 0, 0, 1, 1, 1, 2, 2, 2} {
+		assertSSEIndex(t, payloads[i], want)
+	}
+}
+
 func TestStreamCopyDoesNotFillAnthropicIndexesByDefault(t *testing.T) {
 	t.Parallel()
 

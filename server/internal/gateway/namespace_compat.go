@@ -749,21 +749,23 @@ func (s *anthropicStreamIndexState) fillMissingIndex(data []byte) ([]byte, bool)
 	changed := false
 	switch eventType {
 	case "content_block_start":
-		if !hasIndex {
+		if !hasIndex || index < s.nextIndex {
 			index = s.nextIndex
 			payload["index"] = index
 			changed = true
 		}
 		s.setActive(index)
 	case "content_block_delta":
-		if hasIndex {
+		if s.hasActive {
+			if !hasIndex || index != s.activeIndex {
+				payload["index"] = s.activeIndex
+				changed = true
+			}
+		} else if hasIndex {
 			s.setActive(index)
-		} else if s.hasActive {
-			payload["index"] = s.activeIndex
-			changed = true
 		}
 	case "content_block_stop":
-		if !hasIndex && s.hasActive {
+		if s.hasActive && (!hasIndex || index != s.activeIndex) {
 			payload["index"] = s.activeIndex
 			changed = true
 		}
