@@ -194,7 +194,7 @@ func TestExplicitQuotaExhaustionSurvivesLowerBillingPercentage(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.ReleaseQuotaExhausted(leased)
-	p.RecalculateStatuses(now.Add(time.Minute))
+	p.RecalculateStatuses(a.quotaExhaustedAt.Add(explicitExhaustionMinHold + time.Minute))
 
 	state, _ := p.AccountState(1)
 	if state.Status != StatusExhausted || state.CooldownUntil == nil || !state.CooldownUntil.Equal(resetAt) {
@@ -202,6 +202,47 @@ func TestExplicitQuotaExhaustionSurvivesLowerBillingPercentage(t *testing.T) {
 	}
 	if _, err := p.Acquire(); !errors.Is(err, ErrAllCoolingDown) {
 		t.Fatalf("Acquire error = %v, want ErrAllCoolingDown", err)
+	}
+}
+
+func TestExplicitQuotaExhaustionRecoversAfterFreshBillingRefresh(t *testing.T) {
+	p := New(nil, nil)
+	p.AddAccount(1, "a@x.com", "rt1")
+	a := p.byID[1]
+	now := time.Now()
+	resetAt := now.Add(48 * time.Hour)
+	a.mu.Lock()
+	a.BillingUsage = billing.Usage{
+		WeeklyUsedPercent: 100,
+		WeeklyResetAt:     resetAt,
+		UpdatedAt:         now,
+	}
+	a.mu.Unlock()
+
+	leased, err := p.Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.ReleaseQuotaExhausted(leased)
+	exhaustedAt := a.quotaExhaustedAt
+	a.mu.Lock()
+	a.BillingUsage.WeeklyUsedPercent = 0
+	a.BillingUsage.UpdatedAt = exhaustedAt.Add(time.Minute)
+	a.mu.Unlock()
+
+	p.RecalculateStatuses(exhaustedAt.Add(explicitExhaustionMinHold - time.Second))
+	state, _ := p.AccountState(1)
+	if state.Status != StatusExhausted {
+		t.Fatalf("state before minimum hold = %+v", state)
+	}
+
+	p.RecalculateStatuses(exhaustedAt.Add(explicitExhaustionMinHold))
+	state, _ = p.AccountState(1)
+	if state.Status != StatusActive || state.CooldownUntil != nil {
+		t.Fatalf("state after fresh billing recovery = %+v", state)
+	}
+	if _, err := p.Acquire(); err != nil {
+		t.Fatalf("Acquire after recovery: %v", err)
 	}
 }
 

@@ -12,6 +12,8 @@ import (
 	"grok2api/server/internal/store"
 )
 
+const explicitExhaustionMinHold = 5 * time.Minute
+
 const (
 	StatusActive      = "active"
 	StatusCooldown    = "cooldown"
@@ -41,7 +43,8 @@ type Account struct {
 	AccessToken         string
 	ExpiresAt           time.Time
 	CooldownUntil       time.Time
-	quotaExhaustedUntil time.Time // 上游明确返回额度耗尽后，至少保持到当前周限重置。
+	quotaExhaustedAt    time.Time // 上游明确返回额度耗尽的时间，用于区分之后的新鲜 billing 数据。
+	quotaExhaustedUntil time.Time // 上游明确返回额度耗尽后的最长停用时间。
 	SchedulingDisabled  bool      // 人工调度开关；不影响在途请求和周用量刷新。
 
 	// Grok 订阅周用量（内存缓存，由 billing endpoint 定期刷新）。
@@ -113,6 +116,7 @@ func (p *Pool) AddAccount(id int64, email, refreshToken string) {
 		a.Status = StatusActive
 		a.SchedulingDisabled = false
 		a.CooldownUntil = time.Time{}
+		a.quotaExhaustedAt = time.Time{}
 		a.quotaExhaustedUntil = time.Time{}
 		a.AccessToken = "" // 旧 access_token 作废
 		a.mu.Unlock()
@@ -187,7 +191,7 @@ func (p *Pool) Release(a *Account, cooldownUntil time.Time) {
 }
 
 // ReleaseQuotaExhausted 结束租用并记录上游明确返回的账号额度耗尽状态。
-// billing 百分比可能稍有延迟，因此周期刷新不能在 weekly_reset_at 前提前恢复该账号。
+// billing 百分比可能稍有延迟，因此先保持短暂防抖；之后的新鲜 billing 数据可恢复账号。
 func (p *Pool) ReleaseQuotaExhausted(a *Account) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -199,12 +203,13 @@ func (p *Pool) ReleaseQuotaExhausted(a *Account) {
 		a.inFlight--
 	}
 	now := time.Now()
-	until := now.Add(5 * time.Minute)
+	until := now.Add(explicitExhaustionMinHold)
 	a.mu.Lock()
 	if a.BillingUsage.WeeklyResetAt.After(now) {
 		until = a.BillingUsage.WeeklyResetAt
 	}
 	a.mu.Unlock()
+	a.quotaExhaustedAt = now
 	a.quotaExhaustedUntil = until
 	a.CooldownUntil = until
 	if a.SchedulingDisabled {
@@ -240,18 +245,41 @@ func (p *Pool) RecalculateStatuses(now time.Time) {
 	}
 }
 
+func explicitQuotaExhaustionActiveLocked(a *Account, now time.Time) bool {
+	if a.quotaExhaustedUntil.IsZero() {
+		return false
+	}
+	barrierUntil := a.quotaExhaustedUntil
+	if barrierUntil.After(now) {
+		a.mu.Lock()
+		usage := a.BillingUsage
+		a.mu.Unlock()
+		freshRecovery := !a.quotaExhaustedAt.IsZero() &&
+			!now.Before(a.quotaExhaustedAt.Add(explicitExhaustionMinHold)) &&
+			usage.UpdatedAt.After(a.quotaExhaustedAt) &&
+			usage.WeeklyUsedPercent < 99
+		if !freshRecovery {
+			a.Status = StatusExhausted
+			a.CooldownUntil = barrierUntil
+			return true
+		}
+	}
+	a.quotaExhaustedAt = time.Time{}
+	a.quotaExhaustedUntil = time.Time{}
+	if !a.CooldownUntil.After(barrierUntil) {
+		a.CooldownUntil = time.Time{}
+	}
+	a.Status = StatusActive
+	return false
+}
+
 func (p *Pool) recalculateTimedStatusLocked(a *Account, now time.Time) {
 	if a.SchedulingDisabled {
 		a.Status = StatusDisabled
 		return
 	}
-	if a.quotaExhaustedUntil.After(now) {
-		a.Status = StatusExhausted
-		a.CooldownUntil = a.quotaExhaustedUntil
+	if explicitQuotaExhaustionActiveLocked(a, now) {
 		return
-	}
-	if !a.quotaExhaustedUntil.IsZero() {
-		a.quotaExhaustedUntil = time.Time{}
 	}
 	if a.Status == StatusExhausted && a.CooldownUntil.After(now) {
 		return
@@ -269,13 +297,8 @@ func (p *Pool) recalculateAccountStatusLocked(a *Account, now time.Time) {
 		a.Status = StatusDisabled
 		return
 	}
-	if a.quotaExhaustedUntil.After(now) {
-		a.Status = StatusExhausted
-		a.CooldownUntil = a.quotaExhaustedUntil
+	if explicitQuotaExhaustionActiveLocked(a, now) {
 		return
-	}
-	if !a.quotaExhaustedUntil.IsZero() {
-		a.quotaExhaustedUntil = time.Time{}
 	}
 
 	a.mu.Lock()
@@ -465,6 +488,7 @@ func (p *Pool) RedeemReset(ctx context.Context, id int64) (billing.Usage, error)
 	p.mu.Lock()
 	if current, ok := p.byID[a.ID]; ok && current == a {
 		a.CooldownUntil = time.Time{}
+		a.quotaExhaustedAt = time.Time{}
 		a.quotaExhaustedUntil = time.Time{}
 		p.recalculateAccountStatusLocked(a, time.Now())
 	}
