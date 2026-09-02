@@ -421,7 +421,7 @@ func TestStreamCopyRenumbersRepeatedAnthropicIndexes(t *testing.T) {
 	}
 }
 
-func TestStreamCopySplitsMergedAnthropicToolCalls(t *testing.T) {
+func TestStreamCopyDropsMergedAnthropicToolCallsAfterFirst(t *testing.T) {
 	t.Parallel()
 
 	input := "event: content_block_start\n" +
@@ -437,7 +437,9 @@ func TestStreamCopySplitsMergedAnthropicToolCalls(t *testing.T) {
 		"event: content_block_delta\n" +
 		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"pwd\"}"}}` + "\n\n" +
 		"event: content_block_delta\n" +
-		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"id\"}"}}` + "\n\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp/a.txt\"}"}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp/b.txt\",\"content\":\"12345\"}"}}` + "\n\n" +
 		"event: content_block_stop\n" +
 		`data: {"type":"content_block_stop","index":0}` + "\n\n"
 
@@ -447,30 +449,22 @@ func TestStreamCopySplitsMergedAnthropicToolCalls(t *testing.T) {
 		streamCompatibilityOptions{fillAnthropicIndexes: true},
 	)
 	payloads := decodeSSEPayloads(t, recorder.Body.String())
-	if len(payloads) != 10 {
+	if len(payloads) != 7 {
 		t.Fatalf("payload count = %d, output = %s", len(payloads), recorder.Body.String())
 	}
-	for i, want := range []int{0, 0, 1, 1, 2, 2, 2, 3, 3, 3} {
+	for i, want := range []int{0, 0, 1, 1, 2, 2, 2} {
 		assertSSEIndex(t, payloads[i], want)
 	}
+	firstBlock := payloads[4]["content_block"].(map[string]any)
 	firstDelta := payloads[5]["delta"].(map[string]any)
-	secondBlock := payloads[7]["content_block"].(map[string]any)
-	secondDelta := payloads[8]["delta"].(map[string]any)
-	if firstDelta["partial_json"] != `{"command":"pwd"}` {
-		t.Fatalf("first arguments = %v", firstDelta["partial_json"])
-	}
-	if secondBlock["id"] != "call_1-split-1" || secondBlock["name"] != "bash" {
-		t.Fatalf("second tool block = %#v", secondBlock)
-	}
-	if secondDelta["partial_json"] != `{"command":"id"}` {
-		t.Fatalf("second arguments = %v", secondDelta["partial_json"])
+	if firstBlock["name"] != "bash" || firstDelta["partial_json"] != `{"command":"pwd"}` {
+		t.Fatalf("first tool = %#v arguments = %v", firstBlock, firstDelta["partial_json"])
 	}
 	output := recorder.Body.String()
-	for _, eventType := range []string{"content_block_stop", "content_block_start", "content_block_delta"} {
-		if !strings.Contains(output, "event: "+eventType) {
-			t.Fatalf("missing event label %s: %s", eventType, output)
-		}
+	if strings.Contains(output, "/tmp/a.txt") || strings.Contains(output, "/tmp/b.txt") || strings.Contains(output, "split-") {
+		t.Fatalf("later merged tools were not dropped: %s", output)
 	}
+	assertCanonicalSSE(t, output)
 }
 
 func TestStreamCopyKeepsFragmentedAnthropicToolInputTogether(t *testing.T) {
@@ -573,6 +567,27 @@ func TestUniqueNamespaceToolNameIsSafeAndBounded(t *testing.T) {
 	for _, r := range name {
 		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9') && r != '_' && r != '-' {
 			t.Fatalf("unsafe character %q in %q", r, name)
+		}
+	}
+}
+
+func assertCanonicalSSE(t *testing.T, stream string) {
+	t.Helper()
+	stream = strings.ReplaceAll(stream, "\r\n", "\n")
+	if strings.Contains(stream, "\n\n\n") {
+		t.Fatalf("stream contains extra blank lines: %s", stream)
+	}
+	for _, block := range strings.Split(strings.TrimSpace(stream), "\n\n") {
+		lines := strings.Split(block, "\n")
+		if len(lines) != 2 || !strings.HasPrefix(lines[0], "event: ") || !strings.HasPrefix(lines[1], "data: ") {
+			t.Fatalf("non-canonical SSE block %q in %s", block, stream)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(lines[1], "data:"))), &payload); err != nil {
+			t.Fatalf("decode SSE block %q: %v", block, err)
+		}
+		if eventType, _ := payload["type"].(string); strings.TrimSpace(strings.TrimPrefix(lines[0], "event:")) != eventType {
+			t.Fatalf("event label does not match payload: %q", block)
 		}
 	}
 }

@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -625,98 +624,49 @@ func formatSSEPayloads(payloads [][]byte, lineEnding string) string {
 }
 
 type anthropicMergedToolStreamState struct {
-	contentBlock map[string]any
-	originalID   string
-	arguments    string
-	splitCount   int
+	active    bool
+	arguments string
 }
 
-// splitMergedCalls repairs xAI streams that emit multiple complete tool inputs as
-// deltas of one Anthropic tool_use block. Each input must be a separate content block.
-func (s *anthropicMergedToolStreamState) splitMergedCalls(payload []byte) ([][]byte, bool) {
+// shouldDrop discards extra complete tool inputs that xAI incorrectly appends to
+// one Anthropic tool_use block. Their tool names are unavailable, so guessing is unsafe.
+func (s *anthropicMergedToolStreamState) shouldDrop(payload []byte) bool {
 	dec := json.NewDecoder(bytes.NewReader(payload))
 	dec.UseNumber()
 	var event map[string]any
 	if err := dec.Decode(&event); err != nil {
-		return [][]byte{payload}, false
+		return false
 	}
 
 	eventType, _ := event["type"].(string)
 	switch eventType {
 	case "content_block_start":
 		block, _ := event["content_block"].(map[string]any)
-		if block == nil || block["type"] != "tool_use" {
-			s.contentBlock = nil
-			return [][]byte{payload}, false
-		}
-		s.contentBlock = cloneSchemaValue(block).(map[string]any)
-		s.originalID, _ = block["id"].(string)
+		s.active = block != nil && block["type"] == "tool_use"
 		s.arguments = ""
-		s.splitCount = 0
 	case "content_block_delta":
-		if s.contentBlock == nil {
-			return [][]byte{payload}, false
+		if !s.active {
+			return false
 		}
 		delta, _ := event["delta"].(map[string]any)
 		if delta == nil || delta["type"] != "input_json_delta" {
-			return [][]byte{payload}, false
+			return false
 		}
 		fragment, _ := delta["partial_json"].(string)
-		if !completeJSONObject(s.arguments) || !strings.HasPrefix(strings.TrimSpace(fragment), "{") {
-			s.arguments += fragment
-			return [][]byte{payload}, false
+		if completeJSONObject(s.arguments) && strings.TrimSpace(fragment) != "" {
+			return true
 		}
-
-		s.splitCount++
-		stopEvent := map[string]any{"type": "content_block_stop"}
-		block := cloneSchemaValue(s.contentBlock).(map[string]any)
-		block["id"] = fmt.Sprintf("%s-split-%d", s.originalID, s.splitCount)
-		block["input"] = map[string]any{}
-		startEvent := map[string]any{"type": "content_block_start", "content_block": block}
-		deltaEvent := cloneSchemaValue(event).(map[string]any)
-		delete(deltaEvent, "index")
-		s.arguments = fragment
-		s.contentBlock = block
-
-		stopPayload, _ := json.Marshal(stopEvent)
-		startPayload, _ := json.Marshal(startEvent)
-		deltaPayload, _ := json.Marshal(deltaEvent)
-		return [][]byte{stopPayload, startPayload, deltaPayload}, true
+		s.arguments += fragment
 	case "content_block_stop":
-		s.contentBlock = nil
-		s.originalID = ""
+		s.active = false
 		s.arguments = ""
-		s.splitCount = 0
 	}
-	return [][]byte{payload}, false
+	return false
 }
 
 func completeJSONObject(value string) bool {
 	var object map[string]any
 	return strings.TrimSpace(value) != "" && json.Unmarshal([]byte(value), &object) == nil
-}
-
-func formatAnthropicSSEPayloads(payloads [][]byte, lineEnding string) string {
-	if lineEnding == "" {
-		lineEnding = "\n"
-	}
-	var output strings.Builder
-	for _, payload := range payloads {
-		var event struct {
-			Type string `json:"type"`
-		}
-		_ = json.Unmarshal(payload, &event)
-		if event.Type != "" {
-			output.WriteString("event: ")
-			output.WriteString(event.Type)
-			output.WriteString(lineEnding)
-		}
-		output.WriteString("data: ")
-		output.Write(payload)
-		output.WriteString(lineEnding)
-		output.WriteString(lineEnding)
-	}
-	return output.String()
 }
 
 type streamCompatibilityOptions struct {
@@ -829,6 +779,8 @@ func streamCopyNamespaceSSE(
 	indexState := anthropicStreamIndexState{}
 	anthropicToolState := anthropicMergedToolStreamState{}
 	customState := customToolStreamState{}
+	var pendingSSEFields strings.Builder
+	suppressNextBlank := false
 	downstreamWritable := true
 	for {
 		line, err := reader.ReadString('\n')
@@ -837,7 +789,20 @@ func streamCopyNamespaceSSE(
 		}
 		output := line
 		trimmed := strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		if trimmed != "" && !strings.HasPrefix(trimmed, "data:") {
+			pendingSSEFields.WriteString(line)
+			output = ""
+		} else if trimmed == "" && suppressNextBlank {
+			suppressNextBlank = false
+			output = ""
+		} else if trimmed == "" && pendingSSEFields.Len() > 0 {
+			output = pendingSSEFields.String() + line
+			pendingSSEFields.Reset()
+		}
 		if strings.HasPrefix(trimmed, "data:") {
+			prefix := pendingSSEFields.String()
+			pendingSSEFields.Reset()
+			output = prefix + line
 			data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
 			if data == "[DONE]" {
 				metrics.StreamCompleted = true
@@ -851,39 +816,35 @@ func streamCopyNamespaceSSE(
 					lineEnding = "\n"
 				}
 				if customPayloads, handled := customState.rewrite(payload, mappings); handled {
-					output = formatSSEPayloads(customPayloads, lineEnding)
+					output = prefix + formatSSEPayloads(customPayloads, lineEnding)
+					suppressNextBlank = true
+					payload = nil
+				}
+				if payload != nil && options.fillAnthropicIndexes && anthropicToolState.shouldDrop(payload) {
+					output = ""
+					suppressNextBlank = true
 					payload = nil
 				}
 				if payload != nil {
-					payloads := [][]byte{payload}
-					expanded := false
-					if options.fillAnthropicIndexes {
-						payloads, expanded = anthropicToolState.splitMergedCalls(payload)
-					}
 					changed := false
-					for index, current := range payloads {
-						if options.fillAnthropicIndexes {
-							if rewritten, indexChanged := indexState.fillMissingIndex(current); indexChanged {
-								current = rewritten
-								changed = true
-							}
-						}
-						if options.normalizeAnthropicUsage {
-							if rewritten, usageChanged := normalizeXAIAnthropicUsage(current); usageChanged {
-								current = rewritten
-								changed = true
-							}
-						}
-						if rewritten, namespaceChanged := rewriteNamespaceToolCalls(current, mappings); namespaceChanged {
-							current = rewritten
+					if options.fillAnthropicIndexes {
+						if rewritten, indexChanged := indexState.fillMissingIndex(payload); indexChanged {
+							payload = rewritten
 							changed = true
 						}
-						payloads[index] = current
 					}
-					if expanded {
-						output = formatAnthropicSSEPayloads(payloads, lineEnding)
-					} else if changed {
-						output = "data: " + string(payloads[0]) + lineEnding
+					if options.normalizeAnthropicUsage {
+						if rewritten, usageChanged := normalizeXAIAnthropicUsage(payload); usageChanged {
+							payload = rewritten
+							changed = true
+						}
+					}
+					if rewritten, namespaceChanged := rewriteNamespaceToolCalls(payload, mappings); namespaceChanged {
+						payload = rewritten
+						changed = true
+					}
+					if changed {
+						output = prefix + "data: " + string(payload) + lineEnding
 					}
 				}
 			}
