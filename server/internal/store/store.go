@@ -24,6 +24,7 @@ type AccountRecord struct {
 	UpdatedAt          time.Time  `json:"updated_at"`
 	LastUsedAt         *time.Time `json:"last_used_at"`
 	SchedulingDisabled bool       `json:"scheduling_disabled"`
+	SchedulingWeight   int        `json:"scheduling_weight"`
 }
 
 // PoolAccount 载入账号池用（含解密后的 refresh_token）。
@@ -33,6 +34,7 @@ type PoolAccount struct {
 	Status             string
 	RefreshToken       string
 	SchedulingDisabled bool
+	SchedulingWeight   int
 }
 
 type KeyRecord struct {
@@ -172,7 +174,7 @@ func (s *Store) migrate(ctx context.Context) error {
 func (s *Store) ListAccounts(ctx context.Context) ([]AccountRecord, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, email, subject, status, cooldown_until, created_at, updated_at, last_used_at,
-		       scheduling_disabled
+		       scheduling_disabled, scheduling_weight
 		FROM accounts ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
@@ -185,7 +187,7 @@ func (s *Store) ListAccounts(ctx context.Context) ([]AccountRecord, error) {
 		var email, subject *string
 		if err := rows.Scan(
 			&a.ID, &email, &subject, &a.Status, &a.CooldownUntil,
-			&a.CreatedAt, &a.UpdatedAt, &a.LastUsedAt, &a.SchedulingDisabled,
+			&a.CreatedAt, &a.UpdatedAt, &a.LastUsedAt, &a.SchedulingDisabled, &a.SchedulingWeight,
 		); err != nil {
 			return nil, err
 		}
@@ -202,7 +204,7 @@ func (s *Store) ListAccounts(ctx context.Context) ([]AccountRecord, error) {
 
 func (s *Store) ListPoolAccounts(ctx context.Context) ([]PoolAccount, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, email, status, refresh_token_enc, scheduling_disabled
+		SELECT id, email, status, refresh_token_enc, scheduling_disabled, scheduling_weight
 		FROM accounts
 		WHERE status = 'active'`)
 	if err != nil {
@@ -215,7 +217,7 @@ func (s *Store) ListPoolAccounts(ctx context.Context) ([]PoolAccount, error) {
 		var p PoolAccount
 		var email *string
 		var enc []byte
-		if err := rows.Scan(&p.ID, &email, &p.Status, &enc, &p.SchedulingDisabled); err != nil {
+		if err := rows.Scan(&p.ID, &email, &p.Status, &enc, &p.SchedulingDisabled, &p.SchedulingWeight); err != nil {
 			return nil, err
 		}
 		if email != nil {
@@ -231,12 +233,13 @@ func (s *Store) ListPoolAccounts(ctx context.Context) ([]PoolAccount, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) CreateAccount(ctx context.Context, email, subject, refreshToken string) (int64, error) {
+func (s *Store) CreateAccount(ctx context.Context, email, subject, refreshToken string) (int64, int, error) {
 	enc, err := s.enc.Encrypt([]byte(refreshToken))
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	var id int64
+	var weight int
 	err = s.pool.QueryRow(ctx, `
 		INSERT INTO accounts (email, subject, refresh_token_enc, status)
 		VALUES ($1, $2, $3, 'active')
@@ -246,8 +249,8 @@ func (s *Store) CreateAccount(ctx context.Context, email, subject, refreshToken 
 		    status = 'active',
 		    scheduling_disabled = false,
 		    updated_at = now()
-		RETURNING id`, email, subject, enc).Scan(&id)
-	return id, err
+		RETURNING id, scheduling_weight`, email, subject, enc).Scan(&id, &weight)
+	return id, weight, err
 }
 
 func (s *Store) UpdateRefreshToken(ctx context.Context, id int64, refreshToken string) error {
@@ -269,6 +272,17 @@ func (s *Store) SetAccountSchedulingDisabled(ctx context.Context, id int64, disa
 		UPDATE accounts
 		SET scheduling_disabled = $2, updated_at = now()
 		WHERE id = $1`, id, disabled)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+func (s *Store) SetAccountSchedulingWeight(ctx context.Context, id int64, weight int) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE accounts
+		SET scheduling_weight = $2, updated_at = now()
+		WHERE id = $1`, id, weight)
 	if err != nil {
 		return false, err
 	}

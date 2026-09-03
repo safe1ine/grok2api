@@ -46,6 +46,7 @@ type Account struct {
 	quotaExhaustedAt    time.Time // 上游明确返回额度耗尽的时间，用于区分之后的新鲜 billing 数据。
 	quotaExhaustedUntil time.Time // 上游明确返回额度耗尽后的最长停用时间。
 	SchedulingDisabled  bool      // 人工调度开关；不影响在途请求和周用量刷新。
+	Weight              int       // 调度权重；值越大，空闲和同负载时获得的请求越多。
 
 	// Grok 订阅周用量（内存缓存，由 billing endpoint 定期刷新）。
 	BillingUsage billing.Usage
@@ -53,8 +54,9 @@ type Account struct {
 	mu      sync.Mutex
 	resetMu sync.Mutex // 序列化同一账号的重置券兑换，避免重复消费。
 
-	// inFlight 和 lastAssigned 仅由 Pool.mu 保护，用于并发最少优先的账号选择。
+	// 调度计数仅由 Pool.mu 保护，用于加权最少连接和历史分配比例。
 	inFlight     int
+	assignments  uint64
 	lastAssigned uint64
 }
 
@@ -97,6 +99,7 @@ func (p *Pool) Reload(ctx context.Context) error {
 			RefreshToken:       r.RefreshToken,
 			CooldownUntil:      now,
 			SchedulingDisabled: r.SchedulingDisabled,
+			Weight:             normalizeWeight(r.SchedulingWeight),
 		}
 		if a.SchedulingDisabled {
 			a.Status = StatusDisabled
@@ -106,8 +109,12 @@ func (p *Pool) Reload(ctx context.Context) error {
 	return nil
 }
 
-// AddAccount 新增账号；若 id 已存在（重新授权）则原地更新 refresh_token。
+// AddAccount 新增默认权重账号；若 id 已存在（重新授权）则保留已有权重。
 func (p *Pool) AddAccount(id int64, email, refreshToken string) {
+	p.AddAccountWithWeight(id, email, refreshToken, 0)
+}
+
+func (p *Pool) AddAccountWithWeight(id int64, email, refreshToken string, weight int) {
 	p.mu.Lock()
 	if a, ok := p.byID[id]; ok {
 		a.mu.Lock()
@@ -115,6 +122,11 @@ func (p *Pool) AddAccount(id int64, email, refreshToken string) {
 		a.Email = email
 		a.Status = StatusActive
 		a.SchedulingDisabled = false
+		if weight > 0 {
+			a.Weight = normalizeWeight(weight)
+		} else if a.Weight < 1 {
+			a.Weight = 1
+		}
 		a.CooldownUntil = time.Time{}
 		a.quotaExhaustedAt = time.Time{}
 		a.quotaExhaustedUntil = time.Time{}
@@ -127,6 +139,7 @@ func (p *Pool) AddAccount(id int64, email, refreshToken string) {
 			Status:        StatusActive,
 			RefreshToken:  refreshToken,
 			CooldownUntil: time.Now(),
+			Weight:        normalizeWeight(weight),
 		}
 	}
 	p.mu.Unlock()
@@ -157,8 +170,7 @@ func (p *Pool) AcquireExcluding(excluded map[int64]struct{}) (*Account, error) {
 		if _, skip := excluded[a.ID]; skip {
 			continue
 		}
-		if best == nil || a.inFlight < best.inFlight ||
-			(a.inFlight == best.inFlight && a.lastAssigned < best.lastAssigned) {
+		if best == nil || weightedAccountLess(a, best) {
 			best = a
 		}
 	}
@@ -168,8 +180,32 @@ func (p *Pool) AcquireExcluding(excluded map[int64]struct{}) (*Account, error) {
 
 	p.pickSeq++
 	best.inFlight++
+	best.assignments++
 	best.lastAssigned = p.pickSeq
 	return best, nil
+}
+
+func normalizeWeight(weight int) int {
+	if weight < 1 {
+		return 1
+	}
+	return weight
+}
+
+func weightedAccountLess(candidate, current *Account) bool {
+	candidateWeight := uint64(normalizeWeight(candidate.Weight))
+	currentWeight := uint64(normalizeWeight(current.Weight))
+	candidateLoad := uint64(candidate.inFlight) * currentWeight
+	currentLoad := uint64(current.inFlight) * candidateWeight
+	if candidateLoad != currentLoad {
+		return candidateLoad < currentLoad
+	}
+	candidateShare := candidate.assignments * currentWeight
+	currentShare := current.assignments * candidateWeight
+	if candidateShare != currentShare {
+		return candidateShare < currentShare
+	}
+	return candidate.lastAssigned < current.lastAssigned
 }
 
 // Release 结束一次账号租用；cooldownUntil 为下次可分配的最早时间。
@@ -333,6 +369,21 @@ func (p *Pool) SetSchedulingDisabled(id int64, disabled bool) bool {
 	}
 	a.SchedulingDisabled = disabled
 	p.recalculateAccountStatusLocked(a, time.Now())
+	return true
+}
+
+// SetWeight 更新账号调度权重，并重置历史分配计数以立即应用新比例。
+func (p *Pool) SetWeight(id int64, weight int) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	a, ok := p.byID[id]
+	if !ok {
+		return false
+	}
+	a.Weight = normalizeWeight(weight)
+	for _, account := range p.byID {
+		account.assignments = 0
+	}
 	return true
 }
 

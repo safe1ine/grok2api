@@ -181,6 +181,7 @@ func main() {
 			g.Post("/accounts/{id}/disable", h.DisableAccount)
 			g.Post("/accounts/{id}/enable", h.EnableAccount)
 			g.Post("/accounts/{id}/redeem-reset", h.RedeemAccountReset)
+			g.Put("/accounts/{id}/weight", h.UpdateAccountWeight)
 			g.Delete("/accounts/{id}", h.DeleteAccount)
 			g.Get("/keys", h.ListKeys)
 			g.Post("/keys", h.CreateKey)

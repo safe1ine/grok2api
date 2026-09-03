@@ -117,11 +117,11 @@ func (h *Handler) completeOAuth(w http.ResponseWriter, r *http.Request, code, st
 		email = "unknown-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	}
 	subject := ""
-	id, err := h.store.CreateAccount(r.Context(), email, subject, tok.RefreshToken)
+	id, weight, err := h.store.CreateAccount(r.Context(), email, subject, tok.RefreshToken)
 	if err != nil {
 		return nil, http.StatusInternalServerError, "保存账号失败: " + err.Error()
 	}
-	h.pool.AddAccount(id, email, tok.RefreshToken)
+	h.pool.AddAccountWithWeight(id, email, tok.RefreshToken, weight)
 	return map[string]any{"id": id, "email": email}, http.StatusOK, ""
 }
 
@@ -267,7 +267,7 @@ func (h *Handler) pollDevice(flow *deviceFlow) {
 			if email == "" {
 				email = "unknown-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 			}
-			id, err := h.store.CreateAccount(ctx, email, "", tok.RefreshToken)
+			id, weight, err := h.store.CreateAccount(ctx, email, "", tok.RefreshToken)
 			if err != nil {
 				flow.mu.Lock()
 				flow.State = "failed"
@@ -275,7 +275,7 @@ func (h *Handler) pollDevice(flow *deviceFlow) {
 				flow.mu.Unlock()
 				return
 			}
-			h.pool.AddAccount(id, email, tok.RefreshToken)
+			h.pool.AddAccountWithWeight(id, email, tok.RefreshToken, weight)
 			flow.mu.Lock()
 			flow.State = "complete"
 			flow.AccountID = id
@@ -404,6 +404,36 @@ func (h *Handler) setAccountSchedulingDisabled(w http.ResponseWriter, r *http.Re
 	}
 	h.pool.SetSchedulingDisabled(id, disabled)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "scheduling_disabled": disabled})
+}
+
+func (h *Handler) UpdateAccountWeight(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "无效的账号 id")
+		return
+	}
+	var in struct {
+		Weight int `json:"scheduling_weight"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体格式错误")
+		return
+	}
+	if in.Weight < 1 || in.Weight > 100 {
+		writeErr(w, http.StatusBadRequest, "账号权重必须是 1 到 100 之间的整数")
+		return
+	}
+	found, err := h.store.SetAccountSchedulingWeight(r.Context(), id, in.Weight)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, "账号不存在")
+		return
+	}
+	h.pool.SetWeight(id, in.Weight)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "scheduling_weight": in.Weight})
 }
 
 func (h *Handler) DeleteAccount(w http.ResponseWriter, r *http.Request) {

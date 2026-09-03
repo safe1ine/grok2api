@@ -2,51 +2,51 @@
   "build_version": 4,
   "font_version": "7.9",
   "shard_size": 8192,
-  "ui_fingerprint": "c678298ebe656f44992cce892be920af9b351593249b4cc31c0bd0f9b8f5c429",
-  "requested_ui_codepoints": 1704,
-  "css_sha256": "50a439cec4fa0710155bd15f430b83a076a62140373b42b54292c19a8e7d87ab",
+  "ui_fingerprint": "239f878b73cd56802de648f9fab8bd80958f250f555dffcd99dba492ecf5cf3d",
+  "requested_ui_codepoints": 1714,
+  "css_sha256": "1a1196462138c8c96f3b6104a4093febba5f93094392beff0da4aa81009a37c3",
   "preload_files": [
-    "maple-cn-400-ui.288f30691765.woff2",
-    "maple-cn-600-ui.5efbdad2f814.woff2"
+    "maple-cn-400-ui.e221c9bdae85.woff2",
+    "maple-cn-600-ui.1f3753ea9784.woff2"
   ],
   "files": [
     "maple-cn-400-u0000-1fff.8c44396c5878.woff2",
     "maple-cn-400-u1e000-1ffff.2a7cc2e2361e.woff2",
     "maple-cn-400-u2000-3fff.4e94e6dab6ff.woff2",
-    "maple-cn-400-u4000-5fff.b924e7ce08ac.woff2",
+    "maple-cn-400-u4000-5fff.69b801669e83.woff2",
     "maple-cn-400-u6000-7fff.b841600f89fe.woff2",
-    "maple-cn-400-u8000-9fff.40c9c09c5b67.woff2",
+    "maple-cn-400-u8000-9fff.10bd877749c6.woff2",
     "maple-cn-400-ue000-ffff.ba5774a9212b.woff2",
-    "maple-cn-400-ui.288f30691765.woff2",
+    "maple-cn-400-ui.e221c9bdae85.woff2",
     "maple-cn-600-u0000-1fff.c3e2c4e10941.woff2",
     "maple-cn-600-u1e000-1ffff.7ff503a83734.woff2",
     "maple-cn-600-u2000-3fff.4830e26c5d2e.woff2",
-    "maple-cn-600-u4000-5fff.bde9dfd2dd03.woff2",
+    "maple-cn-600-u4000-5fff.384c1b49486a.woff2",
     "maple-cn-600-u6000-7fff.bb4269c77d37.woff2",
-    "maple-cn-600-u8000-9fff.808b40c8285f.woff2",
+    "maple-cn-600-u8000-9fff.2d13416ab874.woff2",
     "maple-cn-600-ue000-ffff.9d0eee4260c5.woff2",
-    "maple-cn-600-ui.5efbdad2f814.woff2",
+    "maple-cn-600-ui.1f3753ea9784.woff2",
     "maple-cn-700-u0000-1fff.95c9dbd6bca7.woff2",
     "maple-cn-700-u1e000-1ffff.3278480c1037.woff2",
     "maple-cn-700-u2000-3fff.23f1937635d2.woff2",
-    "maple-cn-700-u4000-5fff.5a5258badb63.woff2",
+    "maple-cn-700-u4000-5fff.f13e331ec80f.woff2",
     "maple-cn-700-u6000-7fff.1f6ac292a6fa.woff2",
-    "maple-cn-700-u8000-9fff.b2ed3efdd774.woff2",
+    "maple-cn-700-u8000-9fff.246d2cd56724.woff2",
     "maple-cn-700-ue000-ffff.0f9a07ec9090.woff2",
-    "maple-cn-700-ui.ea7b6b2b8525.woff2"
+    "maple-cn-700-ui.2946434ba7ce.woff2"
   ],
   "weights": {
     "400": {
       "source_sha256": "e42d081eaecbda6a043079eaaaf43ea20bd8805666bc06e1fe4dc663c462ad7f",
       "supported_codepoints": 22731,
-      "ui_codepoints": 1057,
-      "fallback_codepoints": 21674,
+      "ui_codepoints": 1067,
+      "fallback_codepoints": 21664,
       "files": [
         {
-          "file": "maple-cn-400-ui.288f30691765.woff2",
+          "file": "maple-cn-400-ui.e221c9bdae85.woff2",
           "kind": "ui",
-          "bytes": 185288,
-          "glyphs": 1057
+          "bytes": 188112,
+          "glyphs": 1067
         },
         {
           "file": "maple-cn-400-u0000-1fff.8c44396c5878.woff2",
@@ -63,10 +63,10 @@
           "range": "U+2000-3FFF"
         },
         {
-          "file": "maple-cn-400-u4000-5fff.b924e7ce08ac.woff2",
+          "file": "maple-cn-400-u4000-5fff.69b801669e83.woff2",
           "kind": "fallback",
-          "bytes": 1051392,
-          "glyphs": 4389,
+          "bytes": 1051104,
+          "glyphs": 4385,
           "range": "U+4000-5FFF"
         },
         {
@@ -77,10 +77,10 @@
           "range": "U+6000-7FFF"
         },
         {
-          "file": "maple-cn-400-u8000-9fff.40c9c09c5b67.woff2",
+          "file": "maple-cn-400-u8000-9fff.10bd877749c6.woff2",
           "kind": "fallback",
-          "bytes": 2240172,
-          "glyphs": 8052,
+          "bytes": 2237884,
+          "glyphs": 8046,
           "range": "U+8000-9FFF"
         },
         {
@@ -102,14 +102,14 @@
     "600": {
       "source_sha256": "f72d4475c7ac435c7c363e0cb35100a18e4a5bb14787f17f7bbc64823b904066",
       "supported_codepoints": 22731,
-      "ui_codepoints": 1057,
-      "fallback_codepoints": 21674,
+      "ui_codepoints": 1067,
+      "fallback_codepoints": 21664,
       "files": [
         {
-          "file": "maple-cn-600-ui.5efbdad2f814.woff2",
+          "file": "maple-cn-600-ui.1f3753ea9784.woff2",
           "kind": "ui",
-          "bytes": 190264,
-          "glyphs": 1057
+          "bytes": 193248,
+          "glyphs": 1067
         },
         {
           "file": "maple-cn-600-u0000-1fff.c3e2c4e10941.woff2",
@@ -126,10 +126,10 @@
           "range": "U+2000-3FFF"
         },
         {
-          "file": "maple-cn-600-u4000-5fff.bde9dfd2dd03.woff2",
+          "file": "maple-cn-600-u4000-5fff.384c1b49486a.woff2",
           "kind": "fallback",
-          "bytes": 1081004,
-          "glyphs": 4389,
+          "bytes": 1080016,
+          "glyphs": 4385,
           "range": "U+4000-5FFF"
         },
         {
@@ -140,10 +140,10 @@
           "range": "U+6000-7FFF"
         },
         {
-          "file": "maple-cn-600-u8000-9fff.808b40c8285f.woff2",
+          "file": "maple-cn-600-u8000-9fff.2d13416ab874.woff2",
           "kind": "fallback",
-          "bytes": 2303464,
-          "glyphs": 8052,
+          "bytes": 2299624,
+          "glyphs": 8046,
           "range": "U+8000-9FFF"
         },
         {
@@ -165,14 +165,14 @@
     "700": {
       "source_sha256": "54e9890fecbc5f95eb593992c7b9f4413108e4ad1603d3aa37f0c7eb595471e0",
       "supported_codepoints": 22731,
-      "ui_codepoints": 1057,
-      "fallback_codepoints": 21674,
+      "ui_codepoints": 1067,
+      "fallback_codepoints": 21664,
       "files": [
         {
-          "file": "maple-cn-700-ui.ea7b6b2b8525.woff2",
+          "file": "maple-cn-700-ui.2946434ba7ce.woff2",
           "kind": "ui",
-          "bytes": 189936,
-          "glyphs": 1057
+          "bytes": 193124,
+          "glyphs": 1067
         },
         {
           "file": "maple-cn-700-u0000-1fff.95c9dbd6bca7.woff2",
@@ -189,10 +189,10 @@
           "range": "U+2000-3FFF"
         },
         {
-          "file": "maple-cn-700-u4000-5fff.5a5258badb63.woff2",
+          "file": "maple-cn-700-u4000-5fff.f13e331ec80f.woff2",
           "kind": "fallback",
-          "bytes": 1075568,
-          "glyphs": 4389,
+          "bytes": 1074656,
+          "glyphs": 4385,
           "range": "U+4000-5FFF"
         },
         {
@@ -203,10 +203,10 @@
           "range": "U+6000-7FFF"
         },
         {
-          "file": "maple-cn-700-u8000-9fff.b2ed3efdd774.woff2",
+          "file": "maple-cn-700-u8000-9fff.246d2cd56724.woff2",
           "kind": "fallback",
-          "bytes": 2284204,
-          "glyphs": 8052,
+          "bytes": 2283220,
+          "glyphs": 8046,
           "range": "U+8000-9FFF"
         },
         {

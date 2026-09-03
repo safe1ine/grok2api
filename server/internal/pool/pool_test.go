@@ -73,6 +73,55 @@ func TestAcquirePrefersLeastInFlightAndRotatesTies(t *testing.T) {
 	p.Release(a3, time.Now())
 }
 
+func TestWeightedSchedulingUsesConfiguredRatio(t *testing.T) {
+	p := New(nil, nil)
+	p.AddAccount(1, "a@x.com", "rt1")
+	p.AddAccount(2, "b@x.com", "rt2")
+	if p.byID[1].Weight != 1 || p.byID[2].Weight != 1 {
+		t.Fatalf("default weights = %d, %d", p.byID[1].Weight, p.byID[2].Weight)
+	}
+	if !p.SetWeight(2, 3) {
+		t.Fatal("failed to update account weight")
+	}
+
+	counts := map[int64]int{}
+	for range 400 {
+		a, err := p.Acquire()
+		if err != nil {
+			t.Fatal(err)
+		}
+		counts[a.ID]++
+		p.Release(a, time.Now())
+	}
+	if counts[1] != 100 || counts[2] != 300 {
+		t.Fatalf("weighted counts = %v, want 1:3", counts)
+	}
+}
+
+func TestWeightedSchedulingBalancesConcurrentLoad(t *testing.T) {
+	p := New(nil, nil)
+	p.AddAccount(1, "a@x.com", "rt1")
+	p.AddAccount(2, "b@x.com", "rt2")
+	p.SetWeight(2, 3)
+
+	counts := map[int64]int{}
+	leases := make([]*Account, 0, 40)
+	for range 40 {
+		a, err := p.Acquire()
+		if err != nil {
+			t.Fatal(err)
+		}
+		counts[a.ID]++
+		leases = append(leases, a)
+	}
+	if counts[1] != 10 || counts[2] != 30 {
+		t.Fatalf("weighted concurrent counts = %v, want 1:3", counts)
+	}
+	for _, a := range leases {
+		p.Release(a, time.Now())
+	}
+}
+
 func TestAcquireExcludingSelectsDifferentAccount(t *testing.T) {
 	p := New(nil, nil)
 	p.AddAccount(1, "a@x.com", "rt1")

@@ -1,4 +1,4 @@
-import { CopyIcon, ExternalLinkIcon, PlusIcon, PowerIcon, PowerOffIcon, RotateCcwIcon, Trash2Icon, XIcon } from 'lucide-react'
+import { CopyIcon, EllipsisIcon, ExternalLinkIcon, PlusIcon, PowerIcon, PowerOffIcon, RotateCcwIcon, SlidersHorizontalIcon, Trash2Icon, XIcon } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { api, type Account } from '../api'
 import { ConfirmDialog } from '../components/Dialogs'
@@ -74,6 +74,10 @@ export default function Accounts() {
   const [success, setSuccess] = useState('')
   const [redeemingId, setRedeemingId] = useState<number | null>(null)
   const [togglingId, setTogglingId] = useState<number | null>(null)
+  const [updatingWeightId, setUpdatingWeightId] = useState<number | null>(null)
+  const [weightDialog, setWeightDialog] = useState<Account | null>(null)
+  const [weightValue, setWeightValue] = useState('1')
+  const [weightError, setWeightError] = useState('')
   const [deletingId, setDeletingId] = useState<number | null>(null)
   const [accountDialog, setAccountDialog] = useState<AccountDialog | null>(null)
 
@@ -86,7 +90,8 @@ export default function Accounts() {
     if (showLoading) setLoading(true)
     setError('')
     try {
-      setAccounts(await api<Account[]>('/api/accounts'))
+      const loaded = await api<Account[]>('/api/accounts')
+      setAccounts(loaded)
     } catch (e) {
       setError(String(e))
     } finally {
@@ -184,6 +189,38 @@ export default function Accounts() {
     }
   }
 
+  function openWeightDialog(account: Account) {
+    setWeightDialog(account)
+    setWeightValue(String(account.scheduling_weight))
+    setWeightError('')
+  }
+
+  async function updateWeight() {
+    if (!weightDialog) return
+    const weight = Number(weightValue)
+    if (!Number.isInteger(weight) || weight < 1 || weight > 100) {
+      setWeightError('请输入 1 到 100 之间的整数')
+      return
+    }
+    setUpdatingWeightId(weightDialog.id)
+    setWeightError('')
+    setError('')
+    setSuccess('')
+    try {
+      await api(`/api/accounts/${weightDialog.id}/weight`, {
+        method: 'PUT',
+        body: JSON.stringify({ scheduling_weight: weight }),
+      })
+      setSuccess(`${weightDialog.email || `账号 ${weightDialog.id}`} 的权重已更新为 ${weight}`)
+      await load()
+      setWeightDialog(null)
+    } catch (e) {
+      setWeightError(String(e))
+    } finally {
+      setUpdatingWeightId(null)
+    }
+  }
+
   async function remove(account: Account) {
     setDeletingId(account.id)
     setError('')
@@ -223,6 +260,7 @@ export default function Accounts() {
               <th>ID</th>
               <th>邮箱</th>
               <th>状态</th>
+              <th>权重</th>
               <th>会员等级</th>
               <th>周限用量</th>
               <th>重置时间</th>
@@ -232,13 +270,13 @@ export default function Accounts() {
           <tbody>
             {loading ? (
               <tr>
-                <td colSpan={7} className="text-center">
+                <td colSpan={8} className="text-center">
                   <span className="loading loading-spinner" />
                 </td>
               </tr>
             ) : accounts.length === 0 ? (
               <tr>
-                <td colSpan={7} className="text-center text-base-content/50">
+                <td colSpan={8} className="text-center text-base-content/50">
                   还没有账号，点击右上角添加
                 </td>
               </tr>
@@ -248,8 +286,9 @@ export default function Accounts() {
                 const resetCredit = resetCreditState(a)
                 const redeeming = redeemingId === a.id
                 const toggling = togglingId === a.id
+                const updatingWeight = updatingWeightId === a.id
                 const deleting = deletingId === a.id
-                const busy = redeeming || toggling || deleting
+                const busy = redeeming || toggling || updatingWeight || deleting
                 return (
                   <tr key={a.id}>
                     <td>{a.id}</td>
@@ -257,6 +296,7 @@ export default function Accounts() {
                     <td>
                       <span className={`badge ${statusBadge(a.status)}`}>{a.status}</span>
                     </td>
+                    <td className="tabular-nums">{a.scheduling_weight}</td>
                     <td>
                       {a.subscription_tier ? (
                         <span className="badge badge-outline badge-sm whitespace-nowrap">{a.subscription_tier}</span>
@@ -278,46 +318,48 @@ export default function Accounts() {
                       {a.weekly_reset_at ? formatResetCountdown(a.weekly_reset_at) : '-'}
                     </td>
                     <td>
-                      <div className="flex items-center gap-2 whitespace-nowrap">
+                      <div className="dropdown dropdown-end">
                         <button
-                          className={`btn btn-xs ${a.scheduling_disabled ? 'btn-success' : 'btn-warning'} btn-outline`}
+                          type="button"
+                          tabIndex={0}
+                          className="btn btn-ghost btn-xs btn-square"
+                          aria-label={`打开 ${a.email || `账号 ${a.id}`} 的操作菜单`}
                           disabled={busy}
-                          onClick={() => setAccountDialog({ kind: a.scheduling_disabled ? 'enable' : 'disable', account: a })}
                         >
-                          {toggling ? (
-                            <span className="loading loading-spinner loading-xs" />
-                          ) : a.scheduling_disabled ? (
-                            <PowerIcon className="size-3.5" />
-                          ) : (
-                            <PowerOffIcon className="size-3.5" />
-                          )}
-                          {toggling ? '处理中' : a.scheduling_disabled ? '启用' : '禁用'}
+                          {busy ? <span className="loading loading-spinner loading-xs" /> : <EllipsisIcon className="size-4" />}
                         </button>
-                        <div className="tooltip tooltip-left" data-tip={resetCredit.title}>
-                          <button
-                            className={`btn btn-xs ${resetCredit.expiringSoon ? 'btn-warning' : 'btn-outline'}`}
-                            disabled={!resetCredit.available || busy}
-                            onClick={() => setAccountDialog({ kind: 'redeem', account: a })}
-                          >
-                            {redeeming ? (
-                              <span className="loading loading-spinner loading-xs" />
-                            ) : (
-                              <RotateCcwIcon className="size-3.5" />
-                            )}
-                            {redeeming ? '重置中' : '重置'}
-                            {resetCredit.available && !redeeming && (
-                              <span className="badge badge-sm">{a.reset_credits_available}</span>
-                            )}
-                          </button>
-                        </div>
-                        <button
-                          className="btn btn-error btn-xs"
-                          disabled={busy}
-                          onClick={() => setAccountDialog({ kind: 'delete', account: a })}
-                        >
-                          {deleting ? <span className="loading loading-spinner loading-xs" /> : <Trash2Icon className="size-3.5" />}
-                          {deleting ? '删除中' : '删除'}
-                        </button>
+                        <ul tabIndex={0} className="dropdown-content menu z-20 w-44 rounded-box border border-base-300 bg-base-100 p-2 shadow-xl">
+                          <li>
+                            <button type="button" onClick={() => openWeightDialog(a)}>
+                              <SlidersHorizontalIcon className="size-4" />
+                              调整权重
+                            </button>
+                          </li>
+                          <li>
+                            <button type="button" onClick={() => setAccountDialog({ kind: a.scheduling_disabled ? 'enable' : 'disable', account: a })}>
+                              {a.scheduling_disabled ? <PowerIcon className="size-4" /> : <PowerOffIcon className="size-4" />}
+                              {a.scheduling_disabled ? '启用账号' : '禁用账号'}
+                            </button>
+                          </li>
+                          <li>
+                            <button
+                              type="button"
+                              disabled={!resetCredit.available}
+                              title={resetCredit.title}
+                              onClick={() => setAccountDialog({ kind: 'redeem', account: a })}
+                            >
+                              <RotateCcwIcon className="size-4" />
+                              重置周限
+                              {resetCredit.available && <span className="badge badge-sm">{a.reset_credits_available}</span>}
+                            </button>
+                          </li>
+                          <li>
+                            <button type="button" className="text-error" onClick={() => setAccountDialog({ kind: 'delete', account: a })}>
+                              <Trash2Icon className="size-4" />
+                              删除账号
+                            </button>
+                          </li>
+                        </ul>
                       </div>
                     </td>
                   </tr>
@@ -374,6 +416,62 @@ export default function Accounts() {
           else void remove(accountDialog.account)
         }}
       />
+
+      {weightDialog && (
+        <div className="modal modal-open" role="dialog" aria-modal="true" aria-labelledby="weight-dialog-title">
+          <form
+            className="modal-box max-w-md rounded-2xl border border-base-300 shadow-xl"
+            onSubmit={(event) => {
+              event.preventDefault()
+              if (updatingWeightId === null) void updateWeight()
+            }}
+          >
+            <h3 id="weight-dialog-title" className="text-lg font-semibold">调整权重</h3>
+            <p className="mt-2 text-sm text-base-content/60">
+              {weightDialog.email || `账号 ${weightDialog.id}`}，权重越大，分配到的请求越多。
+            </p>
+            <label className="form-control mt-5 gap-2">
+              <span className="label-text">调度权重（1–100）</span>
+              <input
+                autoFocus
+                className={`input input-bordered w-full ${weightError ? 'input-error' : ''}`}
+                type="number"
+                min={1}
+                max={100}
+                step={1}
+                value={weightValue}
+                disabled={updatingWeightId !== null}
+                onChange={(event) => {
+                  setWeightValue(event.target.value)
+                  setWeightError('')
+                }}
+              />
+              {weightError && <span className="text-sm text-error">{weightError}</span>}
+            </label>
+            <div className="modal-action">
+              <button
+                type="button"
+                className="btn btn-ghost"
+                disabled={updatingWeightId !== null}
+                onClick={() => setWeightDialog(null)}
+              >
+                取消
+              </button>
+              <button type="submit" className="btn btn-neutral" disabled={updatingWeightId !== null}>
+                {updatingWeightId !== null && <span className="loading loading-spinner loading-sm" />}
+                {updatingWeightId !== null ? '保存中...' : '保存'}
+              </button>
+            </div>
+          </form>
+          <button
+            type="button"
+            className="modal-backdrop cursor-default"
+            aria-label="关闭权重对话框"
+            disabled={updatingWeightId !== null}
+            onClick={() => setWeightDialog(null)}
+          />
+        </div>
+      )}
 
       {showModal && (
         <div className="modal modal-open">

@@ -23,6 +23,7 @@ export interface Account {
   updated_at: string
   last_used_at: string | null
   scheduling_disabled: boolean
+  scheduling_weight: number
   subscription_tier: string
   weekly_used_percent: number | null
   weekly_reset_at: string | null
