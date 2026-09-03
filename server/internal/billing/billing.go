@@ -237,11 +237,15 @@ func (c *Client) postGRPC(ctx context.Context, path, accessToken, userID string,
 	}
 	applyCLIIdentity(req, accessToken, userID, clientModeCLI)
 	req.Header.Set("Content-Type", grpcContentType)
-	req.Header.Set("Accept", grpcContentType)
+	req.Header.Set("Accept", grpcContentType+", application/json")
 	req.Header.Set("X-Grpc-Web", "1")
 	req.Header.Set("Connect-Protocol-Version", "1")
 	req.Header.Set("Origin", c.webBaseURL)
-	req.Header.Set("Referer", c.webBaseURL+"/?_s=usage")
+	req.Header.Set("Referer", c.webBaseURL+"/")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
 
 	resp, err := c.http.Do(req)
 	if err != nil {

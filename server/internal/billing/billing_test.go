@@ -177,7 +177,10 @@ func TestFetchResetCreditsDecodesAndSortsAvailableCredits(t *testing.T) {
 			r.Header.Get("x-grok-client-version") != clientVersion ||
 			r.Header.Get("x-grok-client-identifier") != clientIdentifier ||
 			r.Header.Get("x-grok-client-mode") != clientModeCLI ||
-			r.Header.Get("User-Agent") != "xai-grok-workspace/"+clientVersion ||
+			r.Header.Get("User-Agent") != "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36" ||
+			r.Header.Get("Sec-Fetch-Site") != "same-origin" ||
+			r.Header.Get("Sec-Fetch-Mode") != "cors" ||
+			r.Header.Get("Sec-Fetch-Dest") != "empty" ||
 			r.Header.Get("x-userid") != "user-123" {
 			t.Errorf("headers = %#v", r.Header)
 		}
