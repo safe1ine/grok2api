@@ -263,6 +263,7 @@ export default function Accounts() {
               <th>权重</th>
               <th>会员等级</th>
               <th>周限用量</th>
+              <th>重置次数</th>
               <th>重置时间</th>
               <th>操作</th>
             </tr>
@@ -270,13 +271,13 @@ export default function Accounts() {
           <tbody>
             {loading ? (
               <tr>
-                <td colSpan={8} className="text-center">
+                <td colSpan={9} className="text-center">
                   <span className="loading loading-spinner" />
                 </td>
               </tr>
             ) : accounts.length === 0 ? (
               <tr>
-                <td colSpan={8} className="text-center text-base-content/50">
+                <td colSpan={9} className="text-center text-base-content/50">
                   还没有账号，点击右上角添加
                 </td>
               </tr>
@@ -314,6 +315,9 @@ export default function Accounts() {
                         <span className="text-base-content/40">-</span>
                       )}
                     </td>
+                    <td className="tabular-nums">
+                      {a.reset_credits_known ? a.reset_credits_available : <span className="text-base-content/40">未知</span>}
+                    </td>
                     <td className="whitespace-nowrap tabular-nums">
                       {a.weekly_reset_at ? formatResetCountdown(a.weekly_reset_at) : '-'}
                     </td>
@@ -344,7 +348,6 @@ export default function Accounts() {
                           <li>
                             <button
                               type="button"
-                              disabled={!resetCredit.available}
                               title={resetCredit.title}
                               onClick={() => setAccountDialog({ kind: 'redeem', account: a })}
                             >
@@ -382,7 +385,10 @@ export default function Accounts() {
               : '删除账号？'}
         description={accountDialog?.kind === 'redeem' ? (
           <>
-            将立即重置 {accountDialog.account.email || `账号 ${accountDialog.account.id}`} 的周限，重置后次数为 {accountDialog.account.reset_credits_available - 1}。
+            将查询 {accountDialog.account.email || `账号 ${accountDialog.account.id}`} 当前可用的重置机会并尝试重置
+            {accountDialog.account.reset_credits_known && accountDialog.account.reset_credits_available > 0
+              ? `，成功后剩余次数为 ${accountDialog.account.reset_credits_available - 1}。`
+              : '。'}
             {accountDialog.account.reset_credit_expires_at && (
               <><br />最近过期时间：{resetTimeFormatter.format(new Date(accountDialog.account.reset_credit_expires_at))}。</>
             )}
