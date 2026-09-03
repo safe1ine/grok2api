@@ -90,20 +90,6 @@ func accountAttemptLimit(p *pool.Pool) int {
 	return min(count, 6)
 }
 
-func parseRetryAfter(resp *http.Response) time.Duration {
-	if s := resp.Header.Get("Retry-After"); s != "" {
-		if n, err := strconv.Atoi(s); err == nil && n > 0 {
-			return time.Duration(n) * time.Second
-		}
-		if t, err := http.ParseTime(s); err == nil {
-			if d := time.Until(t); d > 0 {
-				return d
-			}
-		}
-	}
-	return 60 * time.Second
-}
-
 // ---------- 通用透传 ----------
 
 func withUpstreamCompletionContext(r *http.Request) (*http.Request, context.CancelFunc) {
@@ -285,7 +271,7 @@ accountsLoop:
 					lastFailureReason = reason
 				}
 				resp.Body.Close()
-				g.pool.Release(a, time.Now().Add(parseRetryAfter(resp)))
+				g.pool.Release(a, time.Now())
 				g.pool.RefreshBillingAsync(a.ID)
 				continue accountsLoop
 			}
@@ -589,7 +575,7 @@ accountsLoop:
 			}
 			if resp.StatusCode == http.StatusTooManyRequests {
 				resp.Body.Close()
-				g.pool.Release(a, time.Now().Add(parseRetryAfter(resp)))
+				g.pool.Release(a, time.Now())
 				g.pool.RefreshBillingAsync(a.ID)
 				continue accountsLoop
 			}

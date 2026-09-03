@@ -307,7 +307,64 @@ func TestSimpleUpstreamRetriesDifferentAccountAfterSpendingLimit(t *testing.T) {
 	}
 }
 
-func TestSimpleUpstreamRetriesDifferentAccountAfter429(t *testing.T) {
+func TestProxyRetriesDifferentAccountAfter429WithoutCooldown(t *testing.T) {
+	var mu sync.Mutex
+	var authorizations []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		attempt := len(authorizations)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if attempt == 1 {
+			w.Header().Set("Retry-After", "120")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":"rate limited"}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"usage":{"input_tokens":10,"output_tokens":2}}`)
+	}))
+	defer upstream.Close()
+
+	p := pool.New(nil, nil)
+	p.AddAccount(1, "a@x.com", "refresh-1")
+	p.AddAccount(2, "b@x.com", "refresh-2")
+	for range 2 {
+		a, err := p.Acquire()
+		if err != nil {
+			t.Fatal(err)
+		}
+		a.AccessToken = "access-" + a.Email
+		a.ExpiresAt = time.Now().Add(time.Hour)
+		p.Release(a, time.Now())
+	}
+
+	g := New(&config.Config{XAIAPIBase: upstream.URL}, p, nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4.6"}`))
+	recorder := httptest.NewRecorder()
+	g.Proxy(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	mu.Lock()
+	got := append([]string(nil), authorizations...)
+	mu.Unlock()
+	if len(got) != 2 || got[0] == got[1] {
+		t.Fatalf("authorizations = %v, want two different accounts", got)
+	}
+	for _, id := range []int64{1, 2} {
+		state, ok := p.AccountState(id)
+		if !ok {
+			t.Fatalf("missing account %d", id)
+		}
+		if state.Status != pool.StatusActive || state.CooldownUntil != nil {
+			t.Fatalf("account %d state = %+v, want active without cooldown", id, state)
+		}
+	}
+}
+
+func TestSimpleUpstreamRetriesDifferentAccountAfter429WithoutCooldown(t *testing.T) {
 	var mu sync.Mutex
 	var authorizations []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -357,21 +414,14 @@ func TestSimpleUpstreamRetriesDifferentAccountAfter429(t *testing.T) {
 		t.Fatalf("authorizations = %v, want two different accounts", got)
 	}
 
-	var cooling, active int
 	for _, id := range []int64{1, 2} {
 		state, ok := p.AccountState(id)
 		if !ok {
 			t.Fatalf("missing account %d", id)
 		}
-		switch state.Status {
-		case pool.StatusCooldown:
-			cooling++
-		case pool.StatusActive:
-			active++
+		if state.Status != pool.StatusActive || state.CooldownUntil != nil {
+			t.Fatalf("account %d state = %+v, want active without cooldown", id, state)
 		}
-	}
-	if cooling != 1 || active != 1 {
-		t.Fatalf("cooling=%d active=%d", cooling, active)
 	}
 
 	// Ensure the async billing hook is a no-op without a configured billing client.
