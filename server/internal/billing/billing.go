@@ -16,11 +16,11 @@ import (
 )
 
 const (
-	clientVersion      = "1.0.3"
-	clientIdentifier   = "grok-shell"
-	clientModeHeadless = "headless"
-	grpcContentType    = "application/grpc-web+proto"
-	maxResponseBody    = 1 << 20
+	clientVersion    = "1.0.5"
+	clientIdentifier = "grok-shell"
+	clientModeCLI    = "cli"
+	grpcContentType  = "application/grpc-web+proto"
+	maxResponseBody  = 1 << 20
 )
 
 var ErrNoResetCredit = errors.New("没有可用的周限重置机会")
@@ -82,6 +82,10 @@ func New(baseURL, webBaseURL string) *Client {
 }
 
 func (c *Client) Fetch(ctx context.Context, accessToken string) (Usage, error) {
+	return c.FetchForUser(ctx, accessToken, "")
+}
+
+func (c *Client) FetchForUser(ctx context.Context, accessToken, userID string) (Usage, error) {
 	var payload struct {
 		Config struct {
 			CreditUsagePercent   *float64 `json:"creditUsagePercent"`
@@ -94,7 +98,7 @@ func (c *Client) Fetch(ctx context.Context, accessToken string) (Usage, error) {
 			} `json:"currentPeriod"`
 		} `json:"config"`
 	}
-	if err := c.getJSON(ctx, "/billing?format=credits", accessToken, "billing", &payload); err != nil {
+	if err := c.getJSON(ctx, "/billing?format=credits", accessToken, userID, "billing", &payload); err != nil {
 		return Usage{}, err
 	}
 	if payload.Config.CurrentPeriod.Type != "USAGE_PERIOD_TYPE_WEEKLY" {
@@ -128,12 +132,12 @@ func (c *Client) Fetch(ctx context.Context, accessToken string) (Usage, error) {
 	var settings struct {
 		SubscriptionTierDisplay string `json:"subscription_tier_display"`
 	}
-	if err := c.getJSON(ctx, "/settings", accessToken, "", &settings); err == nil {
+	if err := c.getJSON(ctx, "/settings", accessToken, userID, "", &settings); err == nil {
 		usage.SubscriptionTier = settings.SubscriptionTierDisplay
 	}
 
 	// 重置券是附加能力：查询失败不能影响周用量，也不能把最后一次成功结果覆盖成 0。
-	if credits, err := c.FetchResetCredits(ctx, accessToken); err == nil {
+	if credits, err := c.FetchResetCreditsForUser(ctx, accessToken, userID); err == nil {
 		usage.ResetCredits = credits
 		usage.ResetCreditsUpdatedAt = now
 	} else {
@@ -143,7 +147,11 @@ func (c *Client) Fetch(ctx context.Context, accessToken string) (Usage, error) {
 }
 
 func (c *Client) FetchResetCredits(ctx context.Context, accessToken string) ([]ResetCredit, error) {
-	body, headers, err := c.postGRPC(ctx, "/prod_mc_billing.ConsumerUiSvc/GetRemainingResets", accessToken, grpcFrame(nil))
+	return c.FetchResetCreditsForUser(ctx, accessToken, "")
+}
+
+func (c *Client) FetchResetCreditsForUser(ctx context.Context, accessToken, userID string) ([]ResetCredit, error) {
+	body, headers, err := c.postGRPC(ctx, "/prod_mc_billing.ConsumerUiSvc/GetRemainingResets", accessToken, userID, grpcFrame(nil))
 	if err != nil {
 		return nil, err
 	}
@@ -169,11 +177,15 @@ func (c *Client) FetchResetCredits(ctx context.Context, accessToken string) ([]R
 }
 
 func (c *Client) RedeemReset(ctx context.Context, accessToken, tokenID string) error {
+	return c.RedeemResetForUser(ctx, accessToken, "", tokenID)
+}
+
+func (c *Client) RedeemResetForUser(ctx context.Context, accessToken, userID, tokenID string) error {
 	if tokenID == "" {
 		return ErrNoResetCredit
 	}
 	request := appendProtoBytes(nil, 10, []byte(tokenID))
-	body, headers, err := c.postGRPC(ctx, "/prod_mc_billing.ConsumerUiSvc/RedeemReset", accessToken, grpcFrame(request))
+	body, headers, err := c.postGRPC(ctx, "/prod_mc_billing.ConsumerUiSvc/RedeemReset", accessToken, userID, grpcFrame(request))
 	if err != nil {
 		return err
 	}
@@ -195,12 +207,12 @@ func (c *Client) RedeemReset(ctx context.Context, accessToken, tokenID string) e
 	return nil
 }
 
-func (c *Client) getJSON(ctx context.Context, path, accessToken, mode string, out any) error {
+func (c *Client) getJSON(ctx context.Context, path, accessToken, userID, mode string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
 	if err != nil {
 		return err
 	}
-	applyCLIIdentity(req, accessToken, mode)
+	applyCLIIdentity(req, accessToken, userID, mode)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.http.Do(req)
@@ -218,12 +230,12 @@ func (c *Client) getJSON(ctx context.Context, path, accessToken, mode string, ou
 	return nil
 }
 
-func (c *Client) postGRPC(ctx context.Context, path, accessToken string, body []byte) ([]byte, http.Header, error) {
+func (c *Client) postGRPC(ctx context.Context, path, accessToken, userID string, body []byte) ([]byte, http.Header, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.webBaseURL+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, nil, err
 	}
-	applyCLIIdentity(req, accessToken, clientModeHeadless)
+	applyCLIIdentity(req, accessToken, userID, clientModeCLI)
 	req.Header.Set("Content-Type", grpcContentType)
 	req.Header.Set("Accept", grpcContentType)
 	req.Header.Set("X-Grpc-Web", "1")
@@ -249,11 +261,14 @@ func (c *Client) postGRPC(ctx context.Context, path, accessToken string, body []
 	return responseBody, resp.Header.Clone(), nil
 }
 
-func applyCLIIdentity(req *http.Request, accessToken, mode string) {
+func applyCLIIdentity(req *http.Request, accessToken, userID, mode string) {
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
 	req.Header.Set("x-grok-client-version", clientVersion)
 	req.Header.Set("x-grok-client-identifier", clientIdentifier)
+	if userID != "" {
+		req.Header.Set("x-userid", userID)
+	}
 	if mode != "" {
 		req.Header.Set("x-grok-client-mode", mode)
 	}

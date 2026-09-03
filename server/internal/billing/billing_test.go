@@ -176,8 +176,9 @@ func TestFetchResetCreditsDecodesAndSortsAvailableCredits(t *testing.T) {
 			r.Header.Get("X-XAI-Token-Auth") != "xai-grok-cli" ||
 			r.Header.Get("x-grok-client-version") != clientVersion ||
 			r.Header.Get("x-grok-client-identifier") != clientIdentifier ||
-			r.Header.Get("x-grok-client-mode") != clientModeHeadless ||
-			r.Header.Get("User-Agent") != "xai-grok-workspace/"+clientVersion {
+			r.Header.Get("x-grok-client-mode") != clientModeCLI ||
+			r.Header.Get("User-Agent") != "xai-grok-workspace/"+clientVersion ||
+			r.Header.Get("x-userid") != "user-123" {
 			t.Errorf("headers = %#v", r.Header)
 		}
 		body, _ := io.ReadAll(r.Body)
@@ -189,7 +190,7 @@ func TestFetchResetCreditsDecodesAndSortsAvailableCredits(t *testing.T) {
 	defer server.Close()
 
 	client := New(server.URL, server.URL)
-	credits, err := client.FetchResetCredits(context.Background(), "access-token")
+	credits, err := client.FetchResetCreditsForUser(context.Background(), "access-token", "user-123")
 	if err != nil {
 		t.Fatal(err)
 	}

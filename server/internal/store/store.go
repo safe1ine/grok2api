@@ -31,6 +31,7 @@ type AccountRecord struct {
 type PoolAccount struct {
 	ID                 int64
 	Email              string
+	Subject            string
 	Status             string
 	RefreshToken       string
 	SchedulingDisabled bool
@@ -204,7 +205,7 @@ func (s *Store) ListAccounts(ctx context.Context) ([]AccountRecord, error) {
 
 func (s *Store) ListPoolAccounts(ctx context.Context) ([]PoolAccount, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, email, status, refresh_token_enc, scheduling_disabled, scheduling_weight
+		SELECT id, email, subject, status, refresh_token_enc, scheduling_disabled, scheduling_weight
 		FROM accounts
 		WHERE status = 'active'`)
 	if err != nil {
@@ -215,13 +216,16 @@ func (s *Store) ListPoolAccounts(ctx context.Context) ([]PoolAccount, error) {
 	var out []PoolAccount
 	for rows.Next() {
 		var p PoolAccount
-		var email *string
+		var email, subject *string
 		var enc []byte
-		if err := rows.Scan(&p.ID, &email, &p.Status, &enc, &p.SchedulingDisabled, &p.SchedulingWeight); err != nil {
+		if err := rows.Scan(&p.ID, &email, &subject, &p.Status, &enc, &p.SchedulingDisabled, &p.SchedulingWeight); err != nil {
 			return nil, err
 		}
 		if email != nil {
 			p.Email = *email
+		}
+		if subject != nil {
+			p.Subject = *subject
 		}
 		plain, err := s.enc.Decrypt(enc)
 		if err != nil {
@@ -251,6 +255,11 @@ func (s *Store) CreateAccount(ctx context.Context, email, subject, refreshToken 
 		    updated_at = now()
 		RETURNING id, scheduling_weight`, email, subject, enc).Scan(&id, &weight)
 	return id, weight, err
+}
+
+func (s *Store) UpdateAccountSubject(ctx context.Context, id int64, subject string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE accounts SET subject = $2, updated_at = now() WHERE id = $1`, id, subject)
+	return err
 }
 
 func (s *Store) UpdateRefreshToken(ctx context.Context, id int64, refreshToken string) error {

@@ -34,6 +34,7 @@ type Token struct {
 	RefreshToken string `json:"refresh_token"`
 	ExpiresIn    int    `json:"expires_in"`
 	IDToken      string `json:"id_token"`
+	UserID       string `json:"user_id"`
 }
 
 func New(authBase, clientID, clientSecret, redirectURI, scope string) *Client {
@@ -127,27 +128,37 @@ func (c *Client) Refresh(ctx context.Context, refreshToken string) (*Token, erro
 	return c.postForm(ctx, "/oauth2/token", form)
 }
 
-// EmailFromIDToken 从 id_token 的 payload 里取 email（不验签，仅展示用）。
-func EmailFromIDToken(idToken string) string {
+type idTokenClaims struct {
+	Email string `json:"email"`
+	Sub   string `json:"sub"`
+}
+
+func claimsFromIDToken(idToken string) idTokenClaims {
 	parts := strings.Split(idToken, ".")
 	if len(parts) != 3 {
-		return ""
+		return idTokenClaims{}
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return ""
+		return idTokenClaims{}
 	}
-	var claims struct {
-		Email string `json:"email"`
-		Sub   string `json:"sub"`
-	}
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return ""
-	}
+	var claims idTokenClaims
+	_ = json.Unmarshal(payload, &claims)
+	return claims
+}
+
+// EmailFromIDToken 从 id_token 的 payload 里取 email（不验签，仅展示用）。
+func EmailFromIDToken(idToken string) string {
+	claims := claimsFromIDToken(idToken)
 	if claims.Email != "" {
 		return claims.Email
 	}
 	return claims.Sub
+}
+
+// SubjectFromIDToken 从 id_token 的 payload 里取 xAI 用户 ID。
+func SubjectFromIDToken(idToken string) string {
+	return claimsFromIDToken(idToken).Sub
 }
 
 // ---------- 设备码流程（RFC 8628） ----------

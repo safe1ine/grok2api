@@ -116,12 +116,18 @@ func (h *Handler) completeOAuth(w http.ResponseWriter, r *http.Request, code, st
 		// id_token 理论上必带 sub；这里只是纯兑底，避免 email 唯一索引冲突
 		email = "unknown-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	}
-	subject := ""
+	subject := tok.UserID
+	if subject == "" {
+		subject = oauth.SubjectFromIDToken(tok.IDToken)
+	}
+	if subject == "" {
+		subject = oauth.SubjectFromIDToken(tok.AccessToken)
+	}
 	id, weight, err := h.store.CreateAccount(r.Context(), email, subject, tok.RefreshToken)
 	if err != nil {
 		return nil, http.StatusInternalServerError, "保存账号失败: " + err.Error()
 	}
-	h.pool.AddAccountWithWeight(id, email, tok.RefreshToken, weight)
+	h.pool.AddAccountWithWeight(id, email, subject, tok.RefreshToken, weight)
 	return map[string]any{"id": id, "email": email}, http.StatusOK, ""
 }
 
@@ -267,7 +273,14 @@ func (h *Handler) pollDevice(flow *deviceFlow) {
 			if email == "" {
 				email = "unknown-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 			}
-			id, weight, err := h.store.CreateAccount(ctx, email, "", tok.RefreshToken)
+			subject := tok.UserID
+			if subject == "" {
+				subject = oauth.SubjectFromIDToken(tok.IDToken)
+			}
+			if subject == "" {
+				subject = oauth.SubjectFromIDToken(tok.AccessToken)
+			}
+			id, weight, err := h.store.CreateAccount(ctx, email, subject, tok.RefreshToken)
 			if err != nil {
 				flow.mu.Lock()
 				flow.State = "failed"
@@ -275,7 +288,7 @@ func (h *Handler) pollDevice(flow *deviceFlow) {
 				flow.mu.Unlock()
 				return
 			}
-			h.pool.AddAccountWithWeight(id, email, tok.RefreshToken, weight)
+			h.pool.AddAccountWithWeight(id, email, subject, tok.RefreshToken, weight)
 			flow.mu.Lock()
 			flow.State = "complete"
 			flow.AccountID = id

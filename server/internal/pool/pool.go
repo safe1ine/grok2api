@@ -38,6 +38,7 @@ type AccountState struct {
 type Account struct {
 	ID                  int64
 	Email               string
+	Subject             string
 	Status              string
 	RefreshToken        string // 解密后的明文
 	AccessToken         string
@@ -95,6 +96,7 @@ func (p *Pool) Reload(ctx context.Context) error {
 		a := &Account{
 			ID:                 r.ID,
 			Email:              r.Email,
+			Subject:            r.Subject,
 			Status:             r.Status,
 			RefreshToken:       r.RefreshToken,
 			CooldownUntil:      now,
@@ -111,15 +113,18 @@ func (p *Pool) Reload(ctx context.Context) error {
 
 // AddAccount 新增默认权重账号；若 id 已存在（重新授权）则保留已有权重。
 func (p *Pool) AddAccount(id int64, email, refreshToken string) {
-	p.AddAccountWithWeight(id, email, refreshToken, 0)
+	p.AddAccountWithWeight(id, email, "", refreshToken, 0)
 }
 
-func (p *Pool) AddAccountWithWeight(id int64, email, refreshToken string, weight int) {
+func (p *Pool) AddAccountWithWeight(id int64, email, subject, refreshToken string, weight int) {
 	p.mu.Lock()
 	if a, ok := p.byID[id]; ok {
 		a.mu.Lock()
 		a.RefreshToken = refreshToken
 		a.Email = email
+		if subject != "" {
+			a.Subject = subject
+		}
 		a.Status = StatusActive
 		a.SchedulingDisabled = false
 		if weight > 0 {
@@ -136,6 +141,7 @@ func (p *Pool) AddAccountWithWeight(id int64, email, refreshToken string, weight
 		p.byID[id] = &Account{
 			ID:            id,
 			Email:         email,
+			Subject:       subject,
 			Status:        StatusActive,
 			RefreshToken:  refreshToken,
 			CooldownUntil: time.Now(),
@@ -424,6 +430,19 @@ func (p *Pool) Token(ctx context.Context, a *Account) (string, error) {
 		return "", err
 	}
 	a.AccessToken = tok.AccessToken
+	userID := tok.UserID
+	if userID == "" {
+		userID = oauth.SubjectFromIDToken(tok.IDToken)
+	}
+	if userID == "" {
+		userID = oauth.SubjectFromIDToken(tok.AccessToken)
+	}
+	if userID != "" && userID != a.Subject {
+		a.Subject = userID
+		if err := p.store.UpdateAccountSubject(ctx, a.ID, userID); err != nil {
+			log.Printf("回写账号 %d user_id 失败: %v", a.ID, err)
+		}
+	}
 	if tok.RefreshToken != "" {
 		a.RefreshToken = tok.RefreshToken
 	}
@@ -501,7 +520,7 @@ func (p *Pool) RedeemReset(ctx context.Context, id int64) (billing.Usage, error)
 	if err != nil {
 		return billing.Usage{}, err
 	}
-	credits, err := client.FetchResetCredits(ctx, accessToken)
+	credits, err := client.FetchResetCreditsForUser(ctx, accessToken, a.Subject)
 	if err != nil {
 		return billing.Usage{}, err
 	}
@@ -518,7 +537,7 @@ func (p *Pool) RedeemReset(ctx context.Context, id int64) (billing.Usage, error)
 	}
 
 	credit := available[0]
-	if err := client.RedeemReset(ctx, accessToken, credit.TokenID); err != nil {
+	if err := client.RedeemResetForUser(ctx, accessToken, a.Subject, credit.TokenID); err != nil {
 		return billing.Usage{}, err
 	}
 
@@ -545,7 +564,7 @@ func (p *Pool) RedeemReset(ctx context.Context, id int64) (billing.Usage, error)
 	}
 	p.mu.Unlock()
 
-	if refreshed, refreshErr := client.Fetch(ctx, accessToken); refreshErr == nil {
+	if refreshed, refreshErr := client.FetchForUser(ctx, accessToken, a.Subject); refreshErr == nil {
 		if refreshed.ResetCreditsUpdatedAt.IsZero() {
 			refreshed.ResetCredits = remaining
 			refreshed.ResetCreditsUpdatedAt = time.Now()
@@ -601,7 +620,7 @@ func (p *Pool) refreshBillingAccount(ctx context.Context, id int64) error {
 		}
 		return err
 	}
-	usage, err := client.Fetch(ctx, accessToken)
+	usage, err := client.FetchForUser(ctx, accessToken, a.Subject)
 	if err != nil {
 		return err
 	}
