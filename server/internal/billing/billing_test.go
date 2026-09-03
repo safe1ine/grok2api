@@ -129,6 +129,32 @@ func TestFetchRejectsNonWeeklyPeriod(t *testing.T) {
 	}
 }
 
+func TestFetchPreservesResetCreditLookupError(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/billing":
+			_, _ = w.Write([]byte(`{"config":{"creditUsagePercent":15,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-08-31T08:12:21Z"}}}`))
+		case "/settings":
+			_, _ = w.Write([]byte(`{"subscription_tier_display":"SuperGrok Heavy"}`))
+		case "/prod_mc_billing.ConsumerUiSvc/GetRemainingResets":
+			http.Error(w, "denied", http.StatusForbidden)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	usage, err := New(server.URL, server.URL).Fetch(context.Background(), "access-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.ResetCreditsError == "" || !usage.ResetCreditsUpdatedAt.IsZero() {
+		t.Fatalf("usage = %+v", usage)
+	}
+}
+
 func TestFetchResetCreditsDecodesAndSortsAvailableCredits(t *testing.T) {
 	t.Parallel()
 
@@ -144,7 +170,14 @@ func TestFetchResetCreditsDecodesAndSortsAvailableCredits(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		if r.Header.Get("Authorization") != "Bearer access-token" || r.Header.Get("X-Grpc-Web") != "1" {
+		if r.Header.Get("Authorization") != "Bearer access-token" ||
+			r.Header.Get("X-Grpc-Web") != "1" ||
+			r.Header.Get("Connect-Protocol-Version") != "1" ||
+			r.Header.Get("X-XAI-Token-Auth") != "xai-grok-cli" ||
+			r.Header.Get("x-grok-client-version") != clientVersion ||
+			r.Header.Get("x-grok-client-identifier") != clientIdentifier ||
+			r.Header.Get("x-grok-client-mode") != clientModeHeadless ||
+			r.Header.Get("User-Agent") != "xai-grok-workspace/"+clientVersion {
 			t.Errorf("headers = %#v", r.Header)
 		}
 		body, _ := io.ReadAll(r.Body)

@@ -605,6 +605,9 @@ func (p *Pool) refreshBillingAccount(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
+	if usage.ResetCreditsError != "" {
+		log.Printf("刷新账号 %d Grok 重置次数失败: %s", id, usage.ResetCreditsError)
+	}
 	a.mu.Lock()
 	mergeBillingUsage(a, usage)
 	a.mu.Unlock()

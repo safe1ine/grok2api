@@ -16,9 +16,11 @@ import (
 )
 
 const (
-	clientVersion   = "1.0.3"
-	grpcContentType = "application/grpc-web+proto"
-	maxResponseBody = 1 << 20
+	clientVersion      = "1.0.3"
+	clientIdentifier   = "grok-shell"
+	clientModeHeadless = "headless"
+	grpcContentType    = "application/grpc-web+proto"
+	maxResponseBody    = 1 << 20
 )
 
 var ErrNoResetCredit = errors.New("没有可用的周限重置机会")
@@ -43,6 +45,7 @@ type Usage struct {
 	// ResetCredits 只保存在服务内存中；TokenID 不会返回管理端。
 	ResetCredits          []ResetCredit
 	ResetCreditsUpdatedAt time.Time
+	ResetCreditsError     string
 }
 
 func (u Usage) AvailableResetCredits(now time.Time) []ResetCredit {
@@ -133,6 +136,8 @@ func (c *Client) Fetch(ctx context.Context, accessToken string) (Usage, error) {
 	if credits, err := c.FetchResetCredits(ctx, accessToken); err == nil {
 		usage.ResetCredits = credits
 		usage.ResetCreditsUpdatedAt = now
+	} else {
+		usage.ResetCreditsError = err.Error()
 	}
 	return usage, nil
 }
@@ -195,12 +200,7 @@ func (c *Client) getJSON(ctx context.Context, path, accessToken, mode string, ou
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
-	req.Header.Set("x-grok-client-version", clientVersion)
-	if mode != "" {
-		req.Header.Set("x-grok-client-mode", mode)
-	}
+	applyCLIIdentity(req, accessToken, mode)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.http.Do(req)
@@ -223,13 +223,13 @@ func (c *Client) postGRPC(ctx context.Context, path, accessToken string, body []
 	if err != nil {
 		return nil, nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
+	applyCLIIdentity(req, accessToken, clientModeHeadless)
 	req.Header.Set("Content-Type", grpcContentType)
 	req.Header.Set("Accept", grpcContentType)
 	req.Header.Set("X-Grpc-Web", "1")
+	req.Header.Set("Connect-Protocol-Version", "1")
 	req.Header.Set("Origin", c.webBaseURL)
 	req.Header.Set("Referer", c.webBaseURL+"/?_s=usage")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -247,6 +247,17 @@ func (c *Client) postGRPC(ctx context.Context, path, accessToken string, body []
 		return nil, nil, fmt.Errorf("Grok %s 返回 HTTP %d", path, resp.StatusCode)
 	}
 	return responseBody, resp.Header.Clone(), nil
+}
+
+func applyCLIIdentity(req *http.Request, accessToken, mode string) {
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
+	req.Header.Set("x-grok-client-version", clientVersion)
+	req.Header.Set("x-grok-client-identifier", clientIdentifier)
+	if mode != "" {
+		req.Header.Set("x-grok-client-mode", mode)
+	}
+	req.Header.Set("User-Agent", "xai-grok-workspace/"+clientVersion)
 }
 
 func grpcFrame(message []byte) []byte {
