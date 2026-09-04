@@ -64,6 +64,7 @@ type AccountMenu = { account: Account; top: number; left: number }
 const accountMenuWidth = 176
 const accountMenuFallbackHeight = 176
 const accountMenuViewportGap = 8
+const maxSchedulingWeight = 1000
 
 function accountMenuPosition(trigger: HTMLButtonElement, menuHeight = accountMenuFallbackHeight) {
   const rect = trigger.getBoundingClientRect()
@@ -252,8 +253,8 @@ export default function Accounts() {
   async function updateWeight() {
     if (!weightDialog) return
     const weight = Number(weightValue)
-    if (!Number.isInteger(weight) || weight < 1 || weight > 100) {
-      setWeightError('请输入 1 到 100 之间的整数')
+    if (!Number.isInteger(weight) || weight < 1 || weight > maxSchedulingWeight) {
+      setWeightError(`请输入 1 到 ${maxSchedulingWeight} 之间的整数`)
       return
     }
     setUpdatingWeightId(weightDialog.id)
@@ -539,13 +540,13 @@ export default function Accounts() {
               {weightDialog.email || `账号 ${weightDialog.id}`}，权重越大，分配到的请求越多。
             </p>
             <label className="form-control mt-5 gap-2">
-              <span className="label-text">调度权重（1–100）</span>
+              <span className="label-text">调度权重（1–1000）</span>
               <input
                 autoFocus
                 className={`input input-bordered w-full ${weightError ? 'input-error' : ''}`}
                 type="number"
                 min={1}
-                max={100}
+                max={maxSchedulingWeight}
                 step={1}
                 value={weightValue}
                 disabled={updatingWeightId !== null}

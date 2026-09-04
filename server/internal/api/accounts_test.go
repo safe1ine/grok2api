@@ -8,6 +8,22 @@ import (
 	"grok2api/server/internal/pool"
 )
 
+func TestValidSchedulingWeight(t *testing.T) {
+	for _, tc := range []struct {
+		weight int
+		valid  bool
+	}{
+		{weight: 0, valid: false},
+		{weight: 1, valid: true},
+		{weight: 1000, valid: true},
+		{weight: 1001, valid: false},
+	} {
+		if got := validSchedulingWeight(tc.weight); got != tc.valid {
+			t.Fatalf("validSchedulingWeight(%d) = %t, want %t", tc.weight, got, tc.valid)
+		}
+	}
+}
+
 func TestApplyAccountStateUsesSchedulerStatus(t *testing.T) {
 	until := time.Now().Add(time.Hour)
 	view := accountView{}

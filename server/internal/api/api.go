@@ -23,6 +23,12 @@ import (
 	"grok2api/server/internal/store"
 )
 
+const maxSchedulingWeight = 1000
+
+func validSchedulingWeight(weight int) bool {
+	return weight >= 1 && weight <= maxSchedulingWeight
+}
+
 type Handler struct {
 	cfg   *config.Config
 	store *store.Store
@@ -432,8 +438,8 @@ func (h *Handler) UpdateAccountWeight(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "请求体格式错误")
 		return
 	}
-	if in.Weight < 1 || in.Weight > 100 {
-		writeErr(w, http.StatusBadRequest, "账号权重必须是 1 到 100 之间的整数")
+	if !validSchedulingWeight(in.Weight) {
+		writeErr(w, http.StatusBadRequest, "账号权重必须是 1 到 1000 之间的整数")
 		return
 	}
 	found, err := h.store.SetAccountSchedulingWeight(r.Context(), id, in.Weight)
