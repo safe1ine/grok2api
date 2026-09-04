@@ -267,13 +267,11 @@ accountsLoop:
 				continue
 			}
 			if resp.StatusCode == http.StatusTooManyRequests {
+				lastFailureReason = "上游请求过于频繁"
 				if reason := classifySafeResponseErrorData(errorBody); reason != "" {
 					lastFailureReason = reason
 				}
-				resp.Body.Close()
-				g.pool.Release(a, time.Now())
 				g.pool.RefreshBillingAsync(a.ID)
-				continue accountsLoop
 			}
 
 			copyHeaders(w.Header(), resp.Header, excludeRespHeaders)
@@ -288,6 +286,9 @@ accountsLoop:
 			)
 			responseStats.Stream = metrics.Stream
 			metrics = responseStats
+			if resp.StatusCode == http.StatusTooManyRequests {
+				metrics.ErrorReason = lastFailureReason
+			}
 			resp.Body.Close()
 			g.pool.Release(a, time.Now())
 			break accountsLoop
@@ -502,8 +503,8 @@ func (g *Gateway) HandleSTT(w http.ResponseWriter, r *http.Request) {
 	g.log(r, acct, "stt", "/v1/stt", resp.StatusCode, start, metrics)
 }
 
-// simpleUpstream 用于 TTS/STT；401 刷新一次，429 或账号失效时切换到其他账号。
-// 成功返回时由调用方 Release。
+// simpleUpstream 用于 TTS/STT；401 刷新一次，账号失效时切换到其他账号。
+// 429 直接返回且不冻结账号，避免故障转移破坏权重比例；响应返回后由调用方 Release。
 func (g *Gateway) simpleUpstream(r *http.Request, method, path string, body []byte) (*http.Response, *pool.Account, error) {
 	triedAccounts := map[int64]struct{}{}
 	maxAccountAttempts := accountAttemptLimit(g.pool)
@@ -574,10 +575,7 @@ accountsLoop:
 				continue
 			}
 			if resp.StatusCode == http.StatusTooManyRequests {
-				resp.Body.Close()
-				g.pool.Release(a, time.Now())
 				g.pool.RefreshBillingAsync(a.ID)
-				continue accountsLoop
 			}
 			return resp, a, nil
 		}

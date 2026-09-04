@@ -98,6 +98,26 @@ func TestWeightedSchedulingUsesConfiguredRatio(t *testing.T) {
 	}
 }
 
+func TestWeightedSchedulingUsesHundredToOneRatio(t *testing.T) {
+	p := New(nil, nil)
+	p.AddAccount(1, "a@x.com", "rt1")
+	p.AddAccount(2, "b@x.com", "rt2")
+	p.SetWeight(1, 100)
+
+	counts := map[int64]int{}
+	for range 10100 {
+		a, err := p.Acquire()
+		if err != nil {
+			t.Fatal(err)
+		}
+		counts[a.ID]++
+		p.Release(a, time.Now())
+	}
+	if counts[1] != 10000 || counts[2] != 100 {
+		t.Fatalf("weighted counts = %v, want 100:1", counts)
+	}
+}
+
 func TestWeightedSchedulingBalancesConcurrentLoad(t *testing.T) {
 	p := New(nil, nil)
 	p.AddAccount(1, "a@x.com", "rt1")

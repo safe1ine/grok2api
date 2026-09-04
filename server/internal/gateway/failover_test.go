@@ -307,22 +307,17 @@ func TestSimpleUpstreamRetriesDifferentAccountAfterSpendingLimit(t *testing.T) {
 	}
 }
 
-func TestProxyRetriesDifferentAccountAfter429WithoutCooldown(t *testing.T) {
+func TestProxyReturns429WithoutCooldownOrFailover(t *testing.T) {
 	var mu sync.Mutex
 	var authorizations []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		authorizations = append(authorizations, r.Header.Get("Authorization"))
-		attempt := len(authorizations)
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		if attempt == 1 {
-			w.Header().Set("Retry-After", "120")
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = io.WriteString(w, `{"error":"rate limited"}`)
-			return
-		}
-		_, _ = io.WriteString(w, `{"usage":{"input_tokens":10,"output_tokens":2}}`)
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":"rate limited"}`)
 	}))
 	defer upstream.Close()
 
@@ -343,15 +338,15 @@ func TestProxyRetriesDifferentAccountAfter429WithoutCooldown(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4.6"}`))
 	recorder := httptest.NewRecorder()
 	g.Proxy(recorder, req)
-	if recorder.Code != http.StatusOK {
+	if recorder.Code != http.StatusTooManyRequests || !strings.Contains(recorder.Body.String(), "rate limited") {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 
 	mu.Lock()
 	got := append([]string(nil), authorizations...)
 	mu.Unlock()
-	if len(got) != 2 || got[0] == got[1] {
-		t.Fatalf("authorizations = %v, want two different accounts", got)
+	if len(got) != 1 {
+		t.Fatalf("authorizations = %v, want one account attempt", got)
 	}
 	for _, id := range []int64{1, 2} {
 		state, ok := p.AccountState(id)
@@ -364,20 +359,16 @@ func TestProxyRetriesDifferentAccountAfter429WithoutCooldown(t *testing.T) {
 	}
 }
 
-func TestSimpleUpstreamRetriesDifferentAccountAfter429WithoutCooldown(t *testing.T) {
+func TestSimpleUpstreamReturns429WithoutCooldownOrFailover(t *testing.T) {
 	var mu sync.Mutex
 	var authorizations []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		authorizations = append(authorizations, r.Header.Get("Authorization"))
-		attempt := len(authorizations)
 		mu.Unlock()
-		if attempt == 1 {
-			w.Header().Set("Retry-After", "120")
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
-		}
-		_, _ = w.Write([]byte("ok"))
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("rate limited"))
 	}))
 	defer upstream.Close()
 
@@ -403,15 +394,15 @@ func TestSimpleUpstreamRetriesDifferentAccountAfter429WithoutCooldown(t *testing
 	defer resp.Body.Close()
 	defer p.Release(account, time.Now())
 	body, _ := io.ReadAll(resp.Body)
-	if string(body) != "ok" {
-		t.Fatalf("body = %q", body)
+	if resp.StatusCode != http.StatusTooManyRequests || string(body) != "rate limited" {
+		t.Fatalf("status = %d, body = %q", resp.StatusCode, body)
 	}
 
 	mu.Lock()
 	got := append([]string(nil), authorizations...)
 	mu.Unlock()
-	if len(got) != 2 || got[0] == got[1] {
-		t.Fatalf("authorizations = %v, want two different accounts", got)
+	if len(got) != 1 {
+		t.Fatalf("authorizations = %v, want one account attempt", got)
 	}
 
 	for _, id := range []int64{1, 2} {
