@@ -1,5 +1,6 @@
 import { CopyIcon, EllipsisIcon, ExternalLinkIcon, PlusIcon, PowerIcon, PowerOffIcon, RotateCcwIcon, SlidersHorizontalIcon, Trash2Icon, XIcon } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { api, type Account } from '../api'
 import { ConfirmDialog } from '../components/Dialogs'
 
@@ -58,6 +59,22 @@ function resetCreditState(account: Account) {
 }
 
 type AccountDialog = { kind: 'redeem' | 'disable' | 'enable' | 'delete'; account: Account }
+type AccountMenu = { account: Account; top: number; left: number }
+
+const accountMenuWidth = 176
+const accountMenuFallbackHeight = 176
+const accountMenuViewportGap = 8
+
+function accountMenuPosition(trigger: HTMLButtonElement, menuHeight = accountMenuFallbackHeight) {
+  const rect = trigger.getBoundingClientRect()
+  const maxLeft = Math.max(accountMenuViewportGap, window.innerWidth - accountMenuWidth - accountMenuViewportGap)
+  const left = Math.min(Math.max(accountMenuViewportGap, rect.right - accountMenuWidth), maxLeft)
+  const fitsBelow = rect.bottom + accountMenuViewportGap + menuHeight <= window.innerHeight
+  const top = fitsBelow
+    ? rect.bottom + accountMenuViewportGap
+    : Math.max(accountMenuViewportGap, rect.top - accountMenuViewportGap - menuHeight)
+  return { top, left }
+}
 
 interface DeviceInfo {
   device_code: string
@@ -80,6 +97,9 @@ export default function Accounts() {
   const [weightError, setWeightError] = useState('')
   const [deletingId, setDeletingId] = useState<number | null>(null)
   const [accountDialog, setAccountDialog] = useState<AccountDialog | null>(null)
+  const [accountMenu, setAccountMenu] = useState<AccountMenu | null>(null)
+  const accountMenuRef = useRef<HTMLUListElement | null>(null)
+  const accountMenuTriggerRef = useRef<HTMLButtonElement | null>(null)
 
   const [showModal, setShowModal] = useState(false)
   const [device, setDevice] = useState<DeviceInfo | null>(null)
@@ -104,6 +124,40 @@ export default function Accounts() {
     const timer = window.setInterval(() => void load(false), 5 * 60 * 1000)
     return () => window.clearInterval(timer)
   }, [load])
+
+  useLayoutEffect(() => {
+    if (!accountMenu || !accountMenuRef.current || !accountMenuTriggerRef.current) return
+    const position = accountMenuPosition(accountMenuTriggerRef.current, accountMenuRef.current.offsetHeight)
+    if (position.top === accountMenu.top && position.left === accountMenu.left) return
+    setAccountMenu((current) => current ? { ...current, ...position } : null)
+  }, [accountMenu])
+
+  useEffect(() => {
+    if (!accountMenu) return
+
+    const close = () => setAccountMenu(null)
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node
+      if (accountMenuRef.current?.contains(target) || accountMenuTriggerRef.current?.contains(target)) return
+      close()
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      close()
+      accountMenuTriggerRef.current?.focus()
+    }
+
+    document.addEventListener('pointerdown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    window.addEventListener('resize', close)
+    window.addEventListener('scroll', close, true)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+      window.removeEventListener('resize', close)
+      window.removeEventListener('scroll', close, true)
+    }
+  }, [accountMenu])
 
   async function startAdd() {
     setShowModal(true)
@@ -235,6 +289,8 @@ export default function Accounts() {
     }
   }
 
+  const menuResetCredit = accountMenu ? resetCreditState(accountMenu.account) : null
+
   return (
     <section className="grid gap-6">
       <header className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -284,7 +340,6 @@ export default function Accounts() {
             ) : (
               accounts.map((a) => {
                 const weeklyUsed = a.weekly_used_percent
-                const resetCredit = resetCreditState(a)
                 const redeeming = redeemingId === a.id
                 const toggling = togglingId === a.id
                 const updatingWeight = updatingWeightId === a.id
@@ -322,48 +377,24 @@ export default function Accounts() {
                       {a.weekly_reset_at ? formatResetCountdown(a.weekly_reset_at) : '-'}
                     </td>
                     <td>
-                      <div className="dropdown dropdown-end">
-                        <button
-                          type="button"
-                          tabIndex={0}
-                          className="btn btn-ghost btn-xs btn-square"
-                          aria-label={`打开 ${a.email || `账号 ${a.id}`} 的操作菜单`}
-                          disabled={busy}
-                        >
-                          {busy ? <span className="loading loading-spinner loading-xs" /> : <EllipsisIcon className="size-4" />}
-                        </button>
-                        <ul tabIndex={0} className="dropdown-content menu z-20 w-44 rounded-box border border-base-300 bg-base-100 p-2 shadow-xl">
-                          <li>
-                            <button type="button" onClick={() => openWeightDialog(a)}>
-                              <SlidersHorizontalIcon className="size-4" />
-                              调整权重
-                            </button>
-                          </li>
-                          <li>
-                            <button type="button" onClick={() => setAccountDialog({ kind: a.scheduling_disabled ? 'enable' : 'disable', account: a })}>
-                              {a.scheduling_disabled ? <PowerIcon className="size-4" /> : <PowerOffIcon className="size-4" />}
-                              {a.scheduling_disabled ? '启用账号' : '禁用账号'}
-                            </button>
-                          </li>
-                          <li>
-                            <button
-                              type="button"
-                              title={resetCredit.title}
-                              onClick={() => setAccountDialog({ kind: 'redeem', account: a })}
-                            >
-                              <RotateCcwIcon className="size-4" />
-                              重置周限
-                              {resetCredit.available && <span className="badge badge-sm">{a.reset_credits_available}</span>}
-                            </button>
-                          </li>
-                          <li>
-                            <button type="button" className="text-error" onClick={() => setAccountDialog({ kind: 'delete', account: a })}>
-                              <Trash2Icon className="size-4" />
-                              删除账号
-                            </button>
-                          </li>
-                        </ul>
-                      </div>
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-xs btn-square"
+                        aria-label={`打开 ${a.email || `账号 ${a.id}`} 的操作菜单`}
+                        aria-haspopup="menu"
+                        aria-expanded={accountMenu?.account.id === a.id}
+                        disabled={busy}
+                        onClick={(event) => {
+                          if (accountMenu?.account.id === a.id) {
+                            setAccountMenu(null)
+                            return
+                          }
+                          accountMenuTriggerRef.current = event.currentTarget
+                          setAccountMenu({ account: a, ...accountMenuPosition(event.currentTarget) })
+                        }}
+                      >
+                        {busy ? <span className="loading loading-spinner loading-xs" /> : <EllipsisIcon className="size-4" />}
+                      </button>
                     </td>
                   </tr>
                 )
@@ -373,6 +404,77 @@ export default function Accounts() {
           </table>
         </div>
       </div>
+
+      {accountMenu && menuResetCredit && createPortal(
+        <ul
+          ref={accountMenuRef}
+          role="menu"
+          aria-label={`${accountMenu.account.email || `账号 ${accountMenu.account.id}`} 的操作`}
+          className="menu fixed z-50 w-44 rounded-box border border-base-300 bg-base-100 p-2 shadow-xl"
+          style={{ top: accountMenu.top, left: accountMenu.left }}
+        >
+          <li>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                const account = accountMenu.account
+                setAccountMenu(null)
+                openWeightDialog(account)
+              }}
+            >
+              <SlidersHorizontalIcon className="size-4" />
+              调整权重
+            </button>
+          </li>
+          <li>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                const account = accountMenu.account
+                setAccountMenu(null)
+                setAccountDialog({ kind: account.scheduling_disabled ? 'enable' : 'disable', account })
+              }}
+            >
+              {accountMenu.account.scheduling_disabled ? <PowerIcon className="size-4" /> : <PowerOffIcon className="size-4" />}
+              {accountMenu.account.scheduling_disabled ? '启用账号' : '禁用账号'}
+            </button>
+          </li>
+          <li>
+            <button
+              type="button"
+              role="menuitem"
+              title={menuResetCredit.title}
+              onClick={() => {
+                const account = accountMenu.account
+                setAccountMenu(null)
+                setAccountDialog({ kind: 'redeem', account })
+              }}
+            >
+              <RotateCcwIcon className="size-4" />
+              重置周限
+              {menuResetCredit.available && <span className="badge badge-sm">{accountMenu.account.reset_credits_available}</span>}
+            </button>
+          </li>
+          <li>
+            <button
+              type="button"
+              role="menuitem"
+              className="text-error"
+              onClick={() => {
+                const account = accountMenu.account
+                setAccountMenu(null)
+                setAccountDialog({ kind: 'delete', account })
+              }}
+            >
+              <Trash2Icon className="size-4" />
+              删除账号
+            </button>
+          </li>
+        </ul>,
+        document.body,
+      )}
 
       <ConfirmDialog
         open={accountDialog !== null}
