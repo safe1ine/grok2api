@@ -1,4 +1,4 @@
-import { ChevronDownIcon, ChevronRightIcon, CopyIcon, EllipsisIcon, ExternalLinkIcon, FolderCogIcon, FolderInputIcon, PencilIcon, PlusIcon, PowerIcon, PowerOffIcon, RotateCcwIcon, SlidersHorizontalIcon, Trash2Icon, XIcon } from 'lucide-react'
+import { CheckIcon, ChevronDownIcon, ChevronRightIcon, CopyIcon, EllipsisIcon, ExternalLinkIcon, FolderCogIcon, FolderInputIcon, PencilIcon, PlusIcon, PowerIcon, PowerOffIcon, RotateCcwIcon, SlidersHorizontalIcon, Trash2Icon, XIcon } from 'lucide-react'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { api, type Account, type AccountGroup } from '../api'
@@ -728,14 +728,43 @@ export default function Accounts() {
           <div className="modal-box max-w-md">
             <h3 id="account-group-dialog-title" className="text-lg font-semibold">调整分组</h3>
             <p className="mt-2 text-sm text-base-content/60">{groupDialog.email || `账号 ${groupDialog.id}`}</p>
-            <select
-              className="select select-bordered mt-5 w-full"
-              value={selectedGroupID}
-              disabled={updatingGroup}
-              onChange={(event) => setSelectedGroupID(Number(event.target.value))}
-            >
-              {groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}
-            </select>
+            <div className="dropdown dropdown-bottom mt-5 w-full">
+              <button
+                type="button"
+                tabIndex={0}
+                role="combobox"
+                aria-label="选择账号分组"
+                className="btn btn-outline w-full justify-between font-normal"
+                disabled={updatingGroup}
+              >
+                <span className="truncate">{groups.find((group) => group.id === selectedGroupID)?.name || '请选择分组'}</span>
+                <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
+              </button>
+              <ul
+                tabIndex={0}
+                role="listbox"
+                className="dropdown-content menu z-[60] mt-2 max-h-64 w-full flex-nowrap overflow-y-auto rounded-box border border-base-300 bg-base-100 p-2 shadow-xl"
+              >
+                {groups.map((group) => (
+                  <li key={group.id}>
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected={selectedGroupID === group.id}
+                      className={selectedGroupID === group.id ? 'active' : ''}
+                      onClick={(event) => {
+                        setSelectedGroupID(group.id)
+                        event.currentTarget.blur()
+                      }}
+                    >
+                      <span className="min-w-0 flex-1 truncate text-left">{group.name}</span>
+                      {group.is_default && <span className="badge badge-ghost badge-xs">默认</span>}
+                      {selectedGroupID === group.id && <CheckIcon className="size-4 shrink-0" />}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
             {groupError && <p className="mt-3 text-sm text-error">{groupError}</p>}
             <div className="modal-action">
               <button type="button" className="btn" disabled={updatingGroup} onClick={() => setGroupDialog(null)}>取消</button>
