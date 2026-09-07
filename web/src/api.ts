@@ -71,9 +71,9 @@ export interface LogItem {
 
 export interface LogListResponse {
   items: LogItem[]
-  total: number
   limit: number
-  offset: number
+  has_more: boolean
+  next_cursor?: string
 }
 
 export interface DashboardPoint {

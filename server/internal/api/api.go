@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -647,40 +648,62 @@ func (h *Handler) DeleteKey(w http.ResponseWriter, r *http.Request) {
 // ---------- 调用记录 ----------
 
 type logListResponse struct {
-	Items  []store.CallLog `json:"items"`
-	Total  int64           `json:"total"`
-	Limit  int             `json:"limit"`
-	Offset int             `json:"offset"`
+	Items      []store.CallLog `json:"items"`
+	Limit      int             `json:"limit"`
+	HasMore    bool            `json:"has_more"`
+	NextCursor string          `json:"next_cursor,omitempty"`
 }
 
-func parseLogPagination(r *http.Request) (limit, offset int) {
-	limit = 50
-	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 1000 {
+type logCursor struct {
+	CreatedAt time.Time `json:"created_at"`
+	ID        int64     `json:"id"`
+}
+
+func encodeLogCursor(log store.CallLog) string {
+	data, _ := json.Marshal(logCursor{CreatedAt: log.CreatedAt, ID: log.ID})
+	return base64.RawURLEncoding.EncodeToString(data)
+}
+
+func parseLogPagination(r *http.Request) (int, *store.CallLogCursor, error) {
+	limit := 50
+	if value := r.URL.Query().Get("limit"); value != "" {
+		if n, err := strconv.Atoi(value); err == nil && n > 0 && n <= 1000 {
 			limit = n
 		}
 	}
-	if v := r.URL.Query().Get("offset"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			offset = n
-		}
+	value := r.URL.Query().Get("cursor")
+	if value == "" {
+		return limit, nil, nil
 	}
-	return limit, offset
+	data, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return 0, nil, errors.New("无效的分页游标")
+	}
+	var cursor logCursor
+	if err := json.Unmarshal(data, &cursor); err != nil || cursor.ID <= 0 || cursor.CreatedAt.IsZero() {
+		return 0, nil, errors.New("无效的分页游标")
+	}
+	return limit, &store.CallLogCursor{CreatedAt: cursor.CreatedAt, ID: cursor.ID}, nil
 }
 
 func (h *Handler) ListLogs(w http.ResponseWriter, r *http.Request) {
-	limit, offset := parseLogPagination(r)
-	total, err := h.store.CountCallLogs(r.Context())
+	limit, cursor, err := parseLogPagination(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	logs, err := h.store.ListCallLogs(r.Context(), limit+1, cursor)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	logs, err := h.store.ListCallLogs(r.Context(), limit, offset)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
+	hasMore := len(logs) > limit
+	if hasMore {
+		logs = logs[:limit]
 	}
-	writeJSON(w, http.StatusOK, logListResponse{
-		Items: logs, Total: total, Limit: limit, Offset: offset,
-	})
+	response := logListResponse{Items: logs, Limit: limit, HasMore: hasMore}
+	if hasMore && len(logs) > 0 {
+		response.NextCursor = encodeLogCursor(logs[len(logs)-1])
+	}
+	writeJSON(w, http.StatusOK, response)
 }

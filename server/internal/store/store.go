@@ -567,12 +567,6 @@ func (s *Store) InsertCallLog(ctx context.Context, l CallLog) error {
 	return err
 }
 
-func (s *Store) CountCallLogs(ctx context.Context) (int64, error) {
-	var total int64
-	err := s.pool.QueryRow(ctx, `SELECT count(*) FROM call_logs`).Scan(&total)
-	return total, err
-}
-
 func (s *Store) ListMinuteUsage(
 	ctx context.Context,
 	start, end time.Time,
@@ -658,15 +652,26 @@ func (s *Store) ListUsageKeyOptions(ctx context.Context) ([]UsageKeyOption, erro
 	return keys, rows.Err()
 }
 
-func (s *Store) ListCallLogs(ctx context.Context, limit, offset int) ([]CallLog, error) {
-	rows, err := s.pool.Query(ctx, `
+type CallLogCursor struct {
+	CreatedAt time.Time
+	ID        int64
+}
+
+func (s *Store) ListCallLogs(ctx context.Context, limit int, cursor *CallLogCursor) ([]CallLog, error) {
+	query := `
 		SELECT l.id, l.key_id, l.account_id, l.model, l.endpoint, l.status, l.error_reason,
 		       l.prompt_tokens, l.cached_tokens, l.completion_tokens,
 		       l.ttft_ms, l.latency_ms, l.stream, l.created_at, k.name, a.email
 		FROM call_logs l
 		LEFT JOIN api_keys k ON k.id = l.key_id
-		LEFT JOIN accounts a ON a.id = l.account_id
-		ORDER BY l.id DESC LIMIT $1 OFFSET $2`, limit, offset)
+		LEFT JOIN accounts a ON a.id = l.account_id`
+	args := []any{limit}
+	if cursor != nil {
+		query += ` WHERE (l.created_at, l.id) < ($2, $3)`
+		args = append(args, cursor.CreatedAt, cursor.ID)
+	}
+	query += ` ORDER BY l.created_at DESC, l.id DESC LIMIT $1`
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

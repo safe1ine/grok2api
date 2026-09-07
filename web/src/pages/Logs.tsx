@@ -122,8 +122,8 @@ function loadColumnVisibility(): ColumnVisibility {
 
 export default function Logs() {
   const [logs, setLogs] = useState<LogItem[]>([])
-  const [total, setTotal] = useState(0)
-  const [page, setPage] = useState(1)
+  const [cursorHistory, setCursorHistory] = useState<string[]>([''])
+  const [nextCursor, setNextCursor] = useState<string | null>(null)
   const [pageSize, setPageSize] = useState(50)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -133,21 +133,18 @@ export default function Logs() {
     setLoading(true)
     setError('')
     try {
-      const offset = (page - 1) * pageSize
-      const data = await api<LogListResponse>(`/api/logs?limit=${pageSize}&offset=${offset}`)
-      const lastPage = Math.max(1, Math.ceil(data.total / pageSize))
-      if (page > lastPage) {
-        setPage(lastPage)
-        return
-      }
+      const cursor = cursorHistory[cursorHistory.length - 1]
+      const query = new URLSearchParams({ limit: String(pageSize) })
+      if (cursor) query.set('cursor', cursor)
+      const data = await api<LogListResponse>(`/api/logs?${query}`)
       setLogs(data.items)
-      setTotal(data.total)
+      setNextCursor(data.has_more && data.next_cursor ? data.next_cursor : null)
     } catch (e) {
       setError(String(e))
     } finally {
       setLoading(false)
     }
-  }, [page, pageSize])
+  }, [cursorHistory, pageSize])
 
   useEffect(() => {
     load()
@@ -158,9 +155,7 @@ export default function Logs() {
   }, [visibleColumns])
 
   const visibleColumnCount = Object.values(visibleColumns).filter(Boolean).length
-  const totalPages = Math.max(1, Math.ceil(total / pageSize))
-  const firstItem = total === 0 ? 0 : (page - 1) * pageSize + 1
-  const lastItem = Math.min(page * pageSize, total)
+  const page = cursorHistory.length
 
   return (
     <section className="grid gap-6">
@@ -206,7 +201,7 @@ export default function Logs() {
       <div className="overflow-hidden rounded-2xl border border-base-300 bg-base-100 shadow-sm">
         <div className="border-b border-base-300 px-4 py-4 sm:px-5">
           <h2 className="font-semibold">请求明细</h2>
-          <p className="mt-0.5 text-xs text-base-content/50">共记录 {total} 次调用</p>
+          <p className="mt-0.5 text-xs text-base-content/50">按时间倒序加载调用记录，不执行全表计数</p>
         </div>
         <div className="overflow-x-auto">
           <table className="table whitespace-nowrap">
@@ -310,7 +305,7 @@ export default function Logs() {
 
         <div className="flex flex-col gap-3 border-t border-base-300 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5">
         <div className="text-sm text-base-content/70">
-          共 {total} 条，当前显示第 {firstItem}–{lastItem} 条
+          第 {page} 页，当前显示 {logs.length} 条
         </div>
         <div className="flex flex-wrap items-center gap-3">
           <label className="flex items-center gap-2 text-sm">
@@ -321,7 +316,7 @@ export default function Logs() {
               disabled={loading}
               onChange={(e) => {
                 setPageSize(Number(e.target.value))
-                setPage(1)
+                setCursorHistory([''])
               }}
             >
               <option value={20}>20</option>
@@ -334,7 +329,7 @@ export default function Logs() {
             <button
               className="join-item btn btn-sm"
               disabled={loading || page <= 1}
-              onClick={() => setPage(1)}
+              onClick={() => setCursorHistory([''])}
               aria-label="首页"
             >
               «
@@ -342,27 +337,21 @@ export default function Logs() {
             <button
               className="join-item btn btn-sm"
               disabled={loading || page <= 1}
-              onClick={() => setPage((value) => Math.max(1, value - 1))}
+              onClick={() => setCursorHistory((history) => history.slice(0, -1))}
             >
               上一页
             </button>
             <button className="join-item btn btn-sm btn-disabled" aria-disabled="true">
-              {page} / {totalPages}
+              第 {page} 页
             </button>
             <button
               className="join-item btn btn-sm"
-              disabled={loading || page >= totalPages}
-              onClick={() => setPage((value) => Math.min(totalPages, value + 1))}
+              disabled={loading || !nextCursor}
+              onClick={() => {
+                if (nextCursor) setCursorHistory((history) => [...history, nextCursor])
+              }}
             >
               下一页
-            </button>
-            <button
-              className="join-item btn btn-sm"
-              disabled={loading || page >= totalPages}
-              onClick={() => setPage(totalPages)}
-              aria-label="末页"
-            >
-              »
             </button>
           </div>
         </div>
