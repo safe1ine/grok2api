@@ -60,6 +60,7 @@ function resetCreditState(account: Account) {
 
 type AccountDialog = { kind: 'redeem' | 'disable' | 'enable' | 'delete'; account: Account }
 type AccountMenu = { account: Account; top: number; left: number }
+type GroupDropdown = { top: number; left: number; width: number }
 
 function initialCollapsedGroups() {
   try {
@@ -75,6 +76,16 @@ const accountMenuFallbackHeight = 216
 const accountMenuViewportGap = 8
 const collapsedGroupsStorageKey = 'grok2api_collapsed_account_groups'
 const maxSchedulingWeight = 1000
+
+function floatingMenuPosition(trigger: HTMLButtonElement, menuHeight: number, width = trigger.getBoundingClientRect().width) {
+  const rect = trigger.getBoundingClientRect()
+  const left = Math.min(Math.max(accountMenuViewportGap, rect.left), Math.max(accountMenuViewportGap, window.innerWidth - width - accountMenuViewportGap))
+  const fitsBelow = rect.bottom + accountMenuViewportGap + menuHeight <= window.innerHeight
+  const top = fitsBelow
+    ? rect.bottom + accountMenuViewportGap
+    : Math.max(accountMenuViewportGap, rect.top - accountMenuViewportGap - menuHeight)
+  return { top, left, width }
+}
 
 function accountMenuPosition(trigger: HTMLButtonElement, menuHeight = accountMenuFallbackHeight) {
   const rect = trigger.getBoundingClientRect()
@@ -119,6 +130,9 @@ export default function Accounts() {
   const [groupDialog, setGroupDialog] = useState<Account | null>(null)
   const [selectedGroupID, setSelectedGroupID] = useState(0)
   const [updatingGroup, setUpdatingGroup] = useState(false)
+  const [groupDropdown, setGroupDropdown] = useState<GroupDropdown | null>(null)
+  const groupDropdownTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const groupDropdownMenuRef = useRef<HTMLUListElement | null>(null)
   const accountMenuRef = useRef<HTMLUListElement | null>(null)
   const accountMenuTriggerRef = useRef<HTMLButtonElement | null>(null)
 
@@ -183,6 +197,40 @@ export default function Accounts() {
       window.removeEventListener('scroll', close, true)
     }
   }, [accountMenu])
+
+  useLayoutEffect(() => {
+    if (!groupDropdown || !groupDropdownMenuRef.current || !groupDropdownTriggerRef.current) return
+    const position = floatingMenuPosition(
+      groupDropdownTriggerRef.current,
+      groupDropdownMenuRef.current.offsetHeight,
+      groupDropdown.width,
+    )
+    if (position.top === groupDropdown.top && position.left === groupDropdown.left) return
+    setGroupDropdown(position)
+  }, [groupDropdown])
+
+  useEffect(() => {
+    if (!groupDropdown) return
+    const close = () => setGroupDropdown(null)
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node
+      if (groupDropdownMenuRef.current?.contains(target) || groupDropdownTriggerRef.current?.contains(target)) return
+      close()
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close()
+    }
+    document.addEventListener('pointerdown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    window.addEventListener('resize', close)
+    window.addEventListener('scroll', close, true)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+      window.removeEventListener('resize', close)
+      window.removeEventListener('scroll', close, true)
+    }
+  }, [groupDropdown])
 
   async function startAdd() {
     setShowModal(true)
@@ -384,6 +432,7 @@ export default function Accounts() {
   }
 
   function openGroupDialog(account: Account) {
+    setGroupDropdown(null)
     setGroupDialog(account)
     setSelectedGroupID(account.group_id)
     setGroupError('')
@@ -399,6 +448,7 @@ export default function Accounts() {
         body: JSON.stringify({ group_id: selectedGroupID }),
       })
       await load(false)
+      setGroupDropdown(null)
       setGroupDialog(null)
     } catch (e) {
       setGroupError(String(e))
@@ -728,46 +778,29 @@ export default function Accounts() {
           <div className="modal-box max-w-md">
             <h3 id="account-group-dialog-title" className="text-lg font-semibold">调整分组</h3>
             <p className="mt-2 text-sm text-base-content/60">{groupDialog.email || `账号 ${groupDialog.id}`}</p>
-            <div className="dropdown dropdown-bottom mt-5 w-full">
-              <button
-                type="button"
-                tabIndex={0}
-                role="combobox"
-                aria-label="选择账号分组"
-                className="btn btn-outline w-full justify-between font-normal"
-                disabled={updatingGroup}
-              >
-                <span className="truncate">{groups.find((group) => group.id === selectedGroupID)?.name || '请选择分组'}</span>
-                <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
-              </button>
-              <ul
-                tabIndex={0}
-                role="listbox"
-                className="dropdown-content menu z-[60] mt-2 max-h-64 w-full flex-nowrap overflow-y-auto rounded-box border border-base-300 bg-base-100 p-2 shadow-xl"
-              >
-                {groups.map((group) => (
-                  <li key={group.id}>
-                    <button
-                      type="button"
-                      role="option"
-                      aria-selected={selectedGroupID === group.id}
-                      className={selectedGroupID === group.id ? 'active' : ''}
-                      onClick={(event) => {
-                        setSelectedGroupID(group.id)
-                        event.currentTarget.blur()
-                      }}
-                    >
-                      <span className="min-w-0 flex-1 truncate text-left">{group.name}</span>
-                      {group.is_default && <span className="badge badge-ghost badge-xs">默认</span>}
-                      {selectedGroupID === group.id && <CheckIcon className="size-4 shrink-0" />}
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </div>
+            <button
+              ref={groupDropdownTriggerRef}
+              type="button"
+              role="combobox"
+              aria-label="选择账号分组"
+              aria-expanded={groupDropdown !== null}
+              className="btn btn-outline mt-5 w-full justify-between font-normal"
+              disabled={updatingGroup}
+              onClick={(event) => {
+                if (groupDropdown) {
+                  setGroupDropdown(null)
+                  return
+                }
+                const rect = event.currentTarget.getBoundingClientRect()
+                setGroupDropdown(floatingMenuPosition(event.currentTarget, 256, rect.width))
+              }}
+            >
+              <span className="truncate">{groups.find((group) => group.id === selectedGroupID)?.name || '请选择分组'}</span>
+              <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
+            </button>
             {groupError && <p className="mt-3 text-sm text-error">{groupError}</p>}
             <div className="modal-action">
-              <button type="button" className="btn" disabled={updatingGroup} onClick={() => setGroupDialog(null)}>取消</button>
+              <button type="button" className="btn" disabled={updatingGroup} onClick={() => { setGroupDropdown(null); setGroupDialog(null) }}>取消</button>
               <button
                 type="button"
                 className="btn btn-neutral"
@@ -784,9 +817,45 @@ export default function Accounts() {
             className="modal-backdrop cursor-default"
             aria-label="关闭调整分组"
             disabled={updatingGroup}
-            onClick={() => setGroupDialog(null)}
+            onClick={() => { setGroupDropdown(null); setGroupDialog(null) }}
           />
         </dialog>
+      )}
+
+      {groupDialog && groupDropdown && createPortal(
+        <div
+          className="dropdown dropdown-open fixed z-[1100]"
+          style={{ top: groupDropdown.top, left: groupDropdown.left, width: groupDropdown.width }}
+        >
+          <ul
+            ref={groupDropdownMenuRef}
+            tabIndex={0}
+            role="listbox"
+            aria-label="账号分组"
+            className="dropdown-content menu relative max-h-64 w-full flex-nowrap overflow-y-auto rounded-box border border-base-300 bg-base-100 p-2 shadow-xl"
+          >
+            {groups.map((group) => (
+              <li key={group.id}>
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={selectedGroupID === group.id}
+                  className={selectedGroupID === group.id ? 'active' : ''}
+                  onClick={() => {
+                    setSelectedGroupID(group.id)
+                    setGroupDropdown(null)
+                    groupDropdownTriggerRef.current?.focus()
+                  }}
+                >
+                  <span className="min-w-0 flex-1 truncate text-left">{group.name}</span>
+                  {group.is_default && <span className="badge badge-ghost badge-xs">默认</span>}
+                  {selectedGroupID === group.id && <CheckIcon className="size-4 shrink-0" />}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>,
+        document.body,
       )}
 
       <ConfirmDialog
