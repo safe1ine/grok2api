@@ -191,6 +191,25 @@ func (p *Pool) AcquireExcluding(excluded map[int64]struct{}) (*Account, error) {
 	return best, nil
 }
 
+// AcquireByID 为需要账号粘性的查询租用指定账号；额度耗尽不影响已有异步任务的结果查询。
+func (p *Pool) AcquireByID(id int64) (*Account, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	a, ok := p.byID[id]
+	if !ok {
+		return nil, ErrAccountNotFound
+	}
+	p.recalculateTimedStatusLocked(a, time.Now())
+	if a.SchedulingDisabled || (a.Status != StatusActive && a.Status != StatusExhausted) {
+		return nil, ErrNoAccount
+	}
+	a.inFlight++
+	a.assignments++
+	p.pickSeq++
+	a.lastAssigned = p.pickSeq
+	return a, nil
+}
+
 func normalizeWeight(weight int) int {
 	if weight < 1 {
 		return 1

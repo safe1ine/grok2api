@@ -307,6 +307,80 @@ func TestSimpleUpstreamRetriesDifferentAccountAfterSpendingLimit(t *testing.T) {
 	}
 }
 
+func TestProxyKeepsVideoPollingOnCreatingAccount(t *testing.T) {
+	var mu sync.Mutex
+	var authorizations []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		creator := authorizations[0]
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/videos/generations":
+			_, _ = io.WriteString(w, `{"request_id":"video-job-1"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/videos/video-job-1":
+			if r.Header.Get("Authorization") != creator {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, `{"error":{"code":"not-found"}}`)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = io.WriteString(w, `{"status":"pending"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	p := pool.New(nil, nil)
+	p.AddAccount(1, "a@x.com", "refresh-1")
+	p.AddAccount(2, "b@x.com", "refresh-2")
+	for range 2 {
+		a, err := p.Acquire()
+		if err != nil {
+			t.Fatal(err)
+		}
+		a.AccessToken = "access-" + a.Email
+		a.ExpiresAt = time.Now().Add(time.Hour)
+		p.Release(a, time.Now())
+	}
+
+	g := New(&config.Config{XAIAPIBase: upstream.URL}, p, nil)
+	create := httptest.NewRequest(http.MethodPost, "/v1/videos/generations", strings.NewReader(`{"model":"grok-imagine-video","prompt":"test"}`))
+	createResult := httptest.NewRecorder()
+	g.Proxy(createResult, create)
+	if createResult.Code != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", createResult.Code, createResult.Body.String())
+	}
+
+	poll := httptest.NewRequest(http.MethodGet, "/v1/videos/video-job-1", nil)
+	pollResult := httptest.NewRecorder()
+	g.Proxy(pollResult, poll)
+	if pollResult.Code != http.StatusAccepted {
+		t.Fatalf("poll status=%d body=%s", pollResult.Code, pollResult.Body.String())
+	}
+
+	mu.Lock()
+	got := append([]string(nil), authorizations...)
+	mu.Unlock()
+	if len(got) != 2 || got[0] != got[1] {
+		t.Fatalf("authorizations = %v, want video requests on same account", got)
+	}
+}
+
+func TestVideoJobIdentifiers(t *testing.T) {
+	if got := videoJobIDFromResponse([]byte(`{"request_id":"job-request","id":"job-id"}`)); got != "job-request" {
+		t.Fatalf("response job id = %q", got)
+	}
+	if got := videoJobIDFromPath("/v1/videos/job-request/content"); got != "job-request" {
+		t.Fatalf("path job id = %q", got)
+	}
+	if got := videoJobIDFromPath("/v1/videos/generations"); got != "" {
+		t.Fatalf("generation path job id = %q", got)
+	}
+}
+
 func TestProxyReturns429WithoutCooldownOrFailover(t *testing.T) {
 	var mu sync.Mutex
 	var authorizations []string

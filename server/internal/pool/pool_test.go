@@ -73,6 +73,24 @@ func TestAcquirePrefersLeastInFlightAndRotatesTies(t *testing.T) {
 	p.Release(a3, time.Now())
 }
 
+func TestAcquireByIDUsesRequestedAccount(t *testing.T) {
+	p := New(nil, nil)
+	p.AddAccount(1, "a@x.com", "rt1")
+	p.AddAccount(2, "b@x.com", "rt2")
+
+	a, err := p.AcquireByID(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.ID != 2 {
+		t.Fatalf("account = %d, want 2", a.ID)
+	}
+	p.Release(a, time.Now())
+	if _, err := p.AcquireByID(99); !errors.Is(err, ErrAccountNotFound) {
+		t.Fatalf("missing account error = %v", err)
+	}
+}
+
 func TestWeightedSchedulingUsesConfiguredRatio(t *testing.T) {
 	p := New(nil, nil)
 	p.AddAccount(1, "a@x.com", "rt1")

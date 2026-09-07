@@ -21,7 +21,26 @@ import (
 	"grok2api/server/internal/store"
 )
 
-const upstreamCompletionTimeout = 30 * time.Minute
+const (
+	upstreamCompletionTimeout = 30 * time.Minute
+	videoJobBindingTTL        = 24 * time.Hour
+	videoJobCacheTTL          = 5 * time.Minute
+)
+
+type videoJobBinding struct {
+	accountID int64
+	expiresAt time.Time
+}
+
+type captureResponseWriter struct {
+	http.ResponseWriter
+	body bytes.Buffer
+}
+
+func (w *captureResponseWriter) Write(data []byte) (int, error) {
+	_, _ = w.body.Write(data)
+	return w.ResponseWriter.Write(data)
+}
 
 type Gateway struct {
 	cfg   *config.Config
@@ -33,13 +52,17 @@ type Gateway struct {
 	modelsLoadMu sync.Mutex // 拉取 /models 的单飞锁，避免缓存失效时惊群
 	models       []byte
 	modelsExp    time.Time
+
+	videoJobsMu sync.Mutex
+	videoJobs   map[string]videoJobBinding
 }
 
 func New(cfg *config.Config, p *pool.Pool, s *store.Store) *Gateway {
 	return &Gateway{
-		cfg:   cfg,
-		pool:  p,
-		store: s,
+		cfg:       cfg,
+		pool:      p,
+		store:     s,
+		videoJobs: make(map[string]videoJobBinding),
 		http: &http.Client{
 			Timeout: 0, // 流式长连接，不设总超时
 			Transport: &http.Transport{
@@ -97,6 +120,79 @@ func withUpstreamCompletionContext(r *http.Request) (*http.Request, context.Canc
 	return r.WithContext(ctx), cancel
 }
 
+func isVideoGenerationPath(path string) bool {
+	return path == "/v1/videos/generations"
+}
+
+func videoJobIDFromPath(path string) string {
+	const prefix = "/v1/videos/"
+	if !strings.HasPrefix(path, prefix) || isVideoGenerationPath(path) {
+		return ""
+	}
+	jobID := strings.SplitN(strings.TrimPrefix(path, prefix), "/", 2)[0]
+	return strings.TrimSpace(jobID)
+}
+
+func videoJobIDFromResponse(data []byte) string {
+	var payload struct {
+		RequestID string `json:"request_id"`
+		ID        string `json:"id"`
+	}
+	if json.Unmarshal(data, &payload) != nil {
+		return ""
+	}
+	if payload.RequestID != "" {
+		return payload.RequestID
+	}
+	return payload.ID
+}
+
+func (g *Gateway) rememberVideoJob(ctx context.Context, jobID string, accountID int64) {
+	if jobID == "" {
+		return
+	}
+	binding := videoJobBinding{accountID: accountID, expiresAt: time.Now().Add(videoJobBindingTTL)}
+	g.videoJobsMu.Lock()
+	g.videoJobs[jobID] = binding
+	g.videoJobsMu.Unlock()
+	if g.store != nil {
+		if err := g.store.SaveVideoJob(ctx, jobID, accountID, videoJobBindingTTL); err != nil {
+			log.Printf("保存视频任务账号绑定失败: account=%d err=%v", accountID, err)
+		}
+	}
+}
+
+func (g *Gateway) videoJobAccount(ctx context.Context, jobID string) (int64, bool) {
+	if jobID == "" {
+		return 0, false
+	}
+	now := time.Now()
+	g.videoJobsMu.Lock()
+	binding, ok := g.videoJobs[jobID]
+	if ok && now.Before(binding.expiresAt) {
+		g.videoJobsMu.Unlock()
+		return binding.accountID, true
+	}
+	if ok {
+		delete(g.videoJobs, jobID)
+	}
+	g.videoJobsMu.Unlock()
+	if g.store == nil {
+		return 0, false
+	}
+	accountID, found, err := g.store.VideoJobAccount(ctx, jobID)
+	if err != nil {
+		log.Printf("读取视频任务账号绑定失败: err=%v", err)
+		return 0, false
+	}
+	if found {
+		g.videoJobsMu.Lock()
+		g.videoJobs[jobID] = videoJobBinding{accountID: accountID, expiresAt: now.Add(videoJobCacheTTL)}
+		g.videoJobsMu.Unlock()
+	}
+	return accountID, found
+}
+
 func (g *Gateway) Proxy(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	body, _ := io.ReadAll(r.Body)
@@ -137,11 +233,21 @@ func (g *Gateway) Proxy(w http.ResponseWriter, r *http.Request) {
 	appliedUnsupportedArguments := map[string]bool{}
 	appliedRootSchemaFallback := false
 	compatibilityRetries := 0
+	stickyAccountID, hasStickyAccount := g.videoJobAccount(r.Context(), videoJobIDFromPath(r.URL.Path))
 	maxAccountAttempts := accountAttemptLimit(g.pool)
+	if hasStickyAccount {
+		maxAccountAttempts = 1
+	}
 
 accountsLoop:
 	for accountAttempt := 0; accountAttempt < maxAccountAttempts; accountAttempt++ {
-		a, err := g.pool.AcquireExcluding(triedAccounts)
+		var a *pool.Account
+		var err error
+		if hasStickyAccount {
+			a, err = g.pool.AcquireByID(stickyAccountID)
+		} else {
+			a, err = g.pool.AcquireExcluding(triedAccounts)
+		}
 		if err != nil {
 			break
 		}
@@ -277,8 +383,14 @@ accountsLoop:
 			copyHeaders(w.Header(), resp.Header, excludeRespHeaders)
 			w.WriteHeader(resp.StatusCode)
 			finalStatus = resp.StatusCode
+			responseWriter := w
+			var capturedResponse *captureResponseWriter
+			if isVideoGenerationPath(r.URL.Path) && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				capturedResponse = &captureResponseWriter{ResponseWriter: w}
+				responseWriter = capturedResponse
+			}
 			responseStats := streamCopyWithCompatibility(
-				w, resp.Body, resp.Header.Get("Content-Type"), namespaceMappings, start,
+				responseWriter, resp.Body, resp.Header.Get("Content-Type"), namespaceMappings, start,
 				streamCompatibilityOptions{
 					fillAnthropicIndexes:    r.URL.Path == "/v1/messages",
 					normalizeAnthropicUsage: r.URL.Path == "/v1/messages",
@@ -288,6 +400,9 @@ accountsLoop:
 			metrics = responseStats
 			if resp.StatusCode == http.StatusTooManyRequests {
 				metrics.ErrorReason = lastFailureReason
+			}
+			if capturedResponse != nil {
+				g.rememberVideoJob(r.Context(), videoJobIDFromResponse(capturedResponse.body.Bytes()), a.ID)
 			}
 			resp.Body.Close()
 			g.pool.Release(a, time.Now())

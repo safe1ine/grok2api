@@ -398,6 +398,30 @@ func (s *Store) TouchLastUsed(ctx context.Context, id int64) {
 	_, _ = s.pool.Exec(ctx, `UPDATE accounts SET last_used_at = now() WHERE id = $1`, id)
 }
 
+// ---------- 视频任务 ----------
+
+func (s *Store) SaveVideoJob(ctx context.Context, jobID string, accountID int64, ttl time.Duration) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO video_jobs (job_id, account_id, expires_at)
+		VALUES ($1, $2, now() + $3::interval)
+		ON CONFLICT (job_id) DO UPDATE SET
+		    account_id = EXCLUDED.account_id,
+		    expires_at = EXCLUDED.expires_at`, jobID, accountID, ttl.String())
+	return err
+}
+
+func (s *Store) VideoJobAccount(ctx context.Context, jobID string) (int64, bool, error) {
+	var accountID int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT account_id
+		FROM video_jobs
+		WHERE job_id = $1 AND expires_at > now()`, jobID).Scan(&accountID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	return accountID, err == nil, err
+}
+
 // ---------- OAuth state ----------
 
 func (s *Store) CreateOAuthState(ctx context.Context, state, codeVerifier string, ttl time.Duration) error {
