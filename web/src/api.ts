@@ -24,12 +24,20 @@ export interface Account {
   last_used_at: string | null
   scheduling_disabled: boolean
   scheduling_weight: number
+  group_id: number
   subscription_tier: string
   weekly_used_percent: number | null
   weekly_reset_at: string | null
   reset_credits_known: boolean
   reset_credits_available: number
   reset_credit_expires_at: string | null
+}
+
+export interface AccountGroup {
+  id: number
+  name: string
+  is_default: boolean
+  created_at: string
 }
 
 export interface KeyItem {

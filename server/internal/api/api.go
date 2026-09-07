@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"grok2api/server/internal/auth"
 	"grok2api/server/internal/billing"
@@ -370,6 +372,131 @@ func (h *Handler) ListAccounts(w http.ResponseWriter, r *http.Request) {
 		out = append(out, v)
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func accountGroupName(value string) (string, bool) {
+	name := strings.TrimSpace(value)
+	return name, name != "" && len([]rune(name)) <= 50
+}
+
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+func (h *Handler) ListAccountGroups(w http.ResponseWriter, r *http.Request) {
+	groups, err := h.store.ListAccountGroups(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, groups)
+}
+
+func (h *Handler) CreateAccountGroup(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体格式错误")
+		return
+	}
+	name, ok := accountGroupName(in.Name)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "分组名称必须是 1 到 50 个字符")
+		return
+	}
+	group, err := h.store.CreateAccountGroup(r.Context(), name)
+	if err != nil {
+		if isUniqueViolation(err) {
+			writeErr(w, http.StatusConflict, "分组名称已存在")
+		} else {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusCreated, group)
+}
+
+func (h *Handler) RenameAccountGroup(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "无效的分组 id")
+		return
+	}
+	var in struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体格式错误")
+		return
+	}
+	name, ok := accountGroupName(in.Name)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "分组名称必须是 1 到 50 个字符")
+		return
+	}
+	found, err := h.store.RenameAccountGroup(r.Context(), id, name)
+	if err != nil {
+		if isUniqueViolation(err) {
+			writeErr(w, http.StatusConflict, "分组名称已存在")
+		} else {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, "分组不存在")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (h *Handler) DeleteAccountGroup(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "无效的分组 id")
+		return
+	}
+	found, err := h.store.DeleteAccountGroup(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrDefaultAccountGroup) {
+			writeErr(w, http.StatusConflict, err.Error())
+		} else {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, "分组不存在")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (h *Handler) UpdateAccountGroup(w http.ResponseWriter, r *http.Request) {
+	accountID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "无效的账号 id")
+		return
+	}
+	var in struct {
+		GroupID int64 `json:"group_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.GroupID <= 0 {
+		writeErr(w, http.StatusBadRequest, "无效的分组 id")
+		return
+	}
+	found, err := h.store.SetAccountGroup(r.Context(), accountID, in.GroupID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, "账号或分组不存在")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (h *Handler) RedeemAccountReset(w http.ResponseWriter, r *http.Request) {

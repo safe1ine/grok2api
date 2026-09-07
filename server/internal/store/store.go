@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -13,6 +14,8 @@ import (
 
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
+
+var ErrDefaultAccountGroup = errors.New("默认分组不能删除")
 
 type AccountRecord struct {
 	ID                 int64      `json:"id"`
@@ -25,6 +28,14 @@ type AccountRecord struct {
 	LastUsedAt         *time.Time `json:"last_used_at"`
 	SchedulingDisabled bool       `json:"scheduling_disabled"`
 	SchedulingWeight   int        `json:"scheduling_weight"`
+	GroupID            int64      `json:"group_id"`
+}
+
+type AccountGroup struct {
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	IsDefault bool      `json:"is_default"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // PoolAccount 载入账号池用（含解密后的 refresh_token）。
@@ -175,7 +186,7 @@ func (s *Store) migrate(ctx context.Context) error {
 func (s *Store) ListAccounts(ctx context.Context) ([]AccountRecord, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, email, subject, status, cooldown_until, created_at, updated_at, last_used_at,
-		       scheduling_disabled, scheduling_weight
+		       scheduling_disabled, scheduling_weight, group_id
 		FROM accounts ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
@@ -188,7 +199,7 @@ func (s *Store) ListAccounts(ctx context.Context) ([]AccountRecord, error) {
 		var email, subject *string
 		if err := rows.Scan(
 			&a.ID, &email, &subject, &a.Status, &a.CooldownUntil,
-			&a.CreatedAt, &a.UpdatedAt, &a.LastUsedAt, &a.SchedulingDisabled, &a.SchedulingWeight,
+			&a.CreatedAt, &a.UpdatedAt, &a.LastUsedAt, &a.SchedulingDisabled, &a.SchedulingWeight, &a.GroupID,
 		); err != nil {
 			return nil, err
 		}
@@ -245,8 +256,8 @@ func (s *Store) CreateAccount(ctx context.Context, email, subject, refreshToken 
 	var id int64
 	var weight int
 	err = s.pool.QueryRow(ctx, `
-		INSERT INTO accounts (email, subject, refresh_token_enc, status)
-		VALUES ($1, $2, $3, 'active')
+		INSERT INTO accounts (email, subject, refresh_token_enc, status, group_id)
+		VALUES ($1, $2, $3, 'active', (SELECT id FROM account_groups WHERE is_default LIMIT 1))
 		ON CONFLICT (email) DO UPDATE SET
 		    subject = EXCLUDED.subject,
 		    refresh_token_enc = EXCLUDED.refresh_token_enc,
@@ -292,6 +303,86 @@ func (s *Store) SetAccountSchedulingWeight(ctx context.Context, id int64, weight
 		UPDATE accounts
 		SET scheduling_weight = $2, updated_at = now()
 		WHERE id = $1`, id, weight)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+func (s *Store) ListAccountGroups(ctx context.Context) ([]AccountGroup, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, name, is_default, created_at
+		FROM account_groups
+		ORDER BY is_default DESC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	groups := make([]AccountGroup, 0)
+	for rows.Next() {
+		var group AccountGroup
+		if err := rows.Scan(&group.ID, &group.Name, &group.IsDefault, &group.CreatedAt); err != nil {
+			return nil, err
+		}
+		groups = append(groups, group)
+	}
+	return groups, rows.Err()
+}
+
+func (s *Store) CreateAccountGroup(ctx context.Context, name string) (AccountGroup, error) {
+	var group AccountGroup
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO account_groups (name)
+		VALUES ($1)
+		RETURNING id, name, is_default, created_at`, name).
+		Scan(&group.ID, &group.Name, &group.IsDefault, &group.CreatedAt)
+	return group, err
+}
+
+func (s *Store) RenameAccountGroup(ctx context.Context, id int64, name string) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `UPDATE account_groups SET name = $2 WHERE id = $1`, id, name)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+func (s *Store) DeleteAccountGroup(ctx context.Context, id int64) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	var isDefault bool
+	if err := tx.QueryRow(ctx, `SELECT is_default FROM account_groups WHERE id = $1 FOR UPDATE`, id).Scan(&isDefault); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if isDefault {
+		return false, ErrDefaultAccountGroup
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE accounts
+		SET group_id = (SELECT id FROM account_groups WHERE is_default LIMIT 1), updated_at = now()
+		WHERE group_id = $1`, id); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM account_groups WHERE id = $1`, id); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) SetAccountGroup(ctx context.Context, accountID, groupID int64) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE accounts
+		SET group_id = $2, updated_at = now()
+		WHERE id = $1 AND EXISTS (SELECT 1 FROM account_groups WHERE id = $2)`, accountID, groupID)
 	if err != nil {
 		return false, err
 	}

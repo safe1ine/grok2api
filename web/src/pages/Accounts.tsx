@@ -1,7 +1,7 @@
-import { CopyIcon, EllipsisIcon, ExternalLinkIcon, PlusIcon, PowerIcon, PowerOffIcon, RotateCcwIcon, SlidersHorizontalIcon, Trash2Icon, XIcon } from 'lucide-react'
+import { ChevronDownIcon, ChevronRightIcon, CopyIcon, EllipsisIcon, ExternalLinkIcon, FolderCogIcon, FolderInputIcon, PencilIcon, PlusIcon, PowerIcon, PowerOffIcon, RotateCcwIcon, SlidersHorizontalIcon, Trash2Icon, XIcon } from 'lucide-react'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { api, type Account } from '../api'
+import { api, type Account, type AccountGroup } from '../api'
 import { ConfirmDialog } from '../components/Dialogs'
 
 function statusBadge(status: string) {
@@ -61,9 +61,19 @@ function resetCreditState(account: Account) {
 type AccountDialog = { kind: 'redeem' | 'disable' | 'enable' | 'delete'; account: Account }
 type AccountMenu = { account: Account; top: number; left: number }
 
+function initialCollapsedGroups() {
+  try {
+    const value = JSON.parse(localStorage.getItem(collapsedGroupsStorageKey) || '[]')
+    return new Set<number>(Array.isArray(value) ? value.filter(Number.isInteger) : [])
+  } catch {
+    return new Set<number>()
+  }
+}
+
 const accountMenuWidth = 176
-const accountMenuFallbackHeight = 176
+const accountMenuFallbackHeight = 216
 const accountMenuViewportGap = 8
+const collapsedGroupsStorageKey = 'grok2api_collapsed_account_groups'
 const maxSchedulingWeight = 1000
 
 function accountMenuPosition(trigger: HTMLButtonElement, menuHeight = accountMenuFallbackHeight) {
@@ -87,6 +97,8 @@ interface DeviceInfo {
 
 export default function Accounts() {
   const [accounts, setAccounts] = useState<Account[]>([])
+  const [groups, setGroups] = useState<AccountGroup[]>([])
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<number>>(initialCollapsedGroups)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
@@ -99,6 +111,14 @@ export default function Accounts() {
   const [deletingId, setDeletingId] = useState<number | null>(null)
   const [accountDialog, setAccountDialog] = useState<AccountDialog | null>(null)
   const [accountMenu, setAccountMenu] = useState<AccountMenu | null>(null)
+  const [showGroupManager, setShowGroupManager] = useState(false)
+  const [groupDrafts, setGroupDrafts] = useState<Record<number, string>>({})
+  const [newGroupName, setNewGroupName] = useState('')
+  const [groupBusy, setGroupBusy] = useState<number | 'new' | null>(null)
+  const [groupError, setGroupError] = useState('')
+  const [groupDialog, setGroupDialog] = useState<Account | null>(null)
+  const [selectedGroupID, setSelectedGroupID] = useState(0)
+  const [updatingGroup, setUpdatingGroup] = useState(false)
   const accountMenuRef = useRef<HTMLUListElement | null>(null)
   const accountMenuTriggerRef = useRef<HTMLButtonElement | null>(null)
 
@@ -111,8 +131,12 @@ export default function Accounts() {
     if (showLoading) setLoading(true)
     setError('')
     try {
-      const loaded = await api<Account[]>('/api/accounts')
-      setAccounts(loaded)
+      const [loadedAccounts, loadedGroups] = await Promise.all([
+        api<Account[]>('/api/accounts'),
+        api<AccountGroup[]>('/api/account-groups'),
+      ])
+      setAccounts(loadedAccounts)
+      setGroups(loadedGroups)
     } catch (e) {
       setError(String(e))
     } finally {
@@ -290,16 +314,119 @@ export default function Accounts() {
     }
   }
 
+  function toggleGroup(groupID: number) {
+    setCollapsedGroups((current) => {
+      const next = new Set(current)
+      if (next.has(groupID)) next.delete(groupID)
+      else next.add(groupID)
+      localStorage.setItem(collapsedGroupsStorageKey, JSON.stringify([...next]))
+      return next
+    })
+  }
+
+  function openGroupManager() {
+    setGroupDrafts(Object.fromEntries(groups.map((group) => [group.id, group.name])))
+    setNewGroupName('')
+    setGroupError('')
+    setShowGroupManager(true)
+  }
+
+  async function createGroup() {
+    if (groupBusy !== null || !newGroupName.trim()) return
+    setGroupBusy('new')
+    setGroupError('')
+    try {
+      const created = await api<AccountGroup>('/api/account-groups', { method: 'POST', body: JSON.stringify({ name: newGroupName }) })
+      setNewGroupName('')
+      setGroupDrafts((current) => ({ ...current, [created.id]: created.name }))
+      await load(false)
+    } catch (e) {
+      setGroupError(String(e))
+    } finally {
+      setGroupBusy(null)
+    }
+  }
+
+  async function renameGroup(group: AccountGroup) {
+    const name = groupDrafts[group.id]?.trim()
+    if (groupBusy !== null || !name || name === group.name) return
+    setGroupBusy(group.id)
+    setGroupError('')
+    try {
+      await api(`/api/account-groups/${group.id}`, { method: 'PUT', body: JSON.stringify({ name }) })
+      await load(false)
+    } catch (e) {
+      setGroupError(String(e))
+    } finally {
+      setGroupBusy(null)
+    }
+  }
+
+  async function deleteGroup(group: AccountGroup) {
+    if (groupBusy !== null || group.is_default) return
+    if (!window.confirm(`删除分组“${group.name}”？组内账号将移入默认分组。`)) return
+    setGroupBusy(group.id)
+    setGroupError('')
+    try {
+      await api(`/api/account-groups/${group.id}`, { method: 'DELETE' })
+      setCollapsedGroups((current) => {
+        const next = new Set(current)
+        next.delete(group.id)
+        localStorage.setItem(collapsedGroupsStorageKey, JSON.stringify([...next]))
+        return next
+      })
+      await load(false)
+    } catch (e) {
+      setGroupError(String(e))
+    } finally {
+      setGroupBusy(null)
+    }
+  }
+
+  function openGroupDialog(account: Account) {
+    setGroupDialog(account)
+    setSelectedGroupID(account.group_id)
+    setGroupError('')
+  }
+
+  async function updateAccountGroup() {
+    if (!groupDialog || selectedGroupID <= 0 || updatingGroup) return
+    setUpdatingGroup(true)
+    setGroupError('')
+    try {
+      await api(`/api/accounts/${groupDialog.id}/group`, {
+        method: 'PUT',
+        body: JSON.stringify({ group_id: selectedGroupID }),
+      })
+      await load(false)
+      setGroupDialog(null)
+    } catch (e) {
+      setGroupError(String(e))
+    } finally {
+      setUpdatingGroup(false)
+    }
+  }
+
+  const groupedAccounts = groups.map((group) => ({
+    group,
+    accounts: accounts.filter((account) => account.group_id === group.id),
+  }))
   const menuResetCredit = accountMenu ? resetCreditState(accountMenu.account) : null
 
   return (
     <section className="grid gap-6">
       <header className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <h1 className="text-2xl font-semibold tracking-tight">账号管理</h1>
-        <button className="btn btn-neutral btn-sm self-start sm:self-auto" onClick={startAdd}>
-          <PlusIcon className="size-4" />
-          添加账号
-        </button>
+        <div className="flex items-center gap-2 self-start sm:self-auto">
+          <button className="btn btn-outline btn-sm" onClick={openGroupManager}>
+            <FolderCogIcon className="size-4" />
+            管理分组
+          </button>
+          <button className="btn btn-neutral btn-sm" onClick={startAdd}>
+            <PlusIcon className="size-4" />
+            添加账号
+          </button>
+        </div>
       </header>
 
       {error && <div className="alert border-error/20 bg-error/10 text-error">{error}</div>}
@@ -339,7 +466,25 @@ export default function Accounts() {
                 </td>
               </tr>
             ) : (
-              accounts.map((a) => {
+              groupedAccounts.flatMap(({ group, accounts: groupAccounts }) => [
+                <tr key={`group-${group.id}`} className="bg-base-200/70">
+                  <td colSpan={9} className="p-0">
+                    <button
+                      type="button"
+                      className="flex w-full items-center gap-2 px-4 py-3 text-left font-medium hover:bg-base-200"
+                      aria-expanded={!collapsedGroups.has(group.id)}
+                      onClick={() => toggleGroup(group.id)}
+                    >
+                      {collapsedGroups.has(group.id)
+                        ? <ChevronRightIcon className="size-4 shrink-0" />
+                        : <ChevronDownIcon className="size-4 shrink-0" />}
+                      <span>{group.name}</span>
+                      {group.is_default && <span className="badge badge-ghost badge-xs">默认</span>}
+                      <span className="text-xs font-normal text-base-content/50">{groupAccounts.length} 个账号</span>
+                    </button>
+                  </td>
+                </tr>,
+                ...(collapsedGroups.has(group.id) ? [] : groupAccounts.map((a) => {
                 const weeklyUsed = a.weekly_used_percent
                 const redeeming = redeemingId === a.id
                 const toggling = togglingId === a.id
@@ -399,7 +544,8 @@ export default function Accounts() {
                     </td>
                   </tr>
                 )
-              })
+              })),
+              ])
             )}
           </tbody>
           </table>
@@ -426,6 +572,20 @@ export default function Accounts() {
             >
               <SlidersHorizontalIcon className="size-4" />
               调整权重
+            </button>
+          </li>
+          <li>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                const account = accountMenu.account
+                setAccountMenu(null)
+                openGroupDialog(account)
+              }}
+            >
+              <FolderInputIcon className="size-4" />
+              调整分组
             </button>
           </li>
           <li>
@@ -475,6 +635,129 @@ export default function Accounts() {
           </li>
         </ul>,
         document.body,
+      )}
+
+      {showGroupManager && (
+        <dialog className="modal modal-open" aria-labelledby="group-manager-title">
+          <div className="modal-box max-w-xl">
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm btn-circle absolute right-3 top-3"
+              aria-label="关闭分组管理"
+              disabled={groupBusy !== null}
+              onClick={() => setShowGroupManager(false)}
+            >
+              <XIcon className="size-4" />
+            </button>
+            <h3 id="group-manager-title" className="text-lg font-semibold">管理分组</h3>
+            <p className="mt-1 text-sm text-base-content/60">删除分组后，组内账号会自动移入默认分组。</p>
+
+            <div className="mt-5 grid gap-3">
+              {groups.map((group) => (
+                <div key={group.id} className="flex items-center gap-2 rounded-xl border border-base-300 p-3">
+                  <input
+                    className="input input-bordered input-sm min-w-0 flex-1"
+                    value={groupDrafts[group.id] ?? group.name}
+                    maxLength={50}
+                    disabled={groupBusy !== null}
+                    aria-label={`${group.name}的名称`}
+                    onChange={(event) => setGroupDrafts((current) => ({ ...current, [group.id]: event.target.value }))}
+                  />
+                  {group.is_default && <span className="badge badge-ghost badge-sm shrink-0">默认</span>}
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm btn-square"
+                    title="保存名称"
+                    disabled={groupBusy !== null || !(groupDrafts[group.id] ?? '').trim() || groupDrafts[group.id]?.trim() === group.name}
+                    onClick={() => void renameGroup(group)}
+                  >
+                    {groupBusy === group.id ? <span className="loading loading-spinner loading-xs" /> : <PencilIcon className="size-4" />}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm btn-square text-error"
+                    title={group.is_default ? '默认分组不能删除' : '删除分组'}
+                    disabled={groupBusy !== null || group.is_default}
+                    onClick={() => void deleteGroup(group)}
+                  >
+                    <Trash2Icon className="size-4" />
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-4 flex gap-2 border-t border-base-300 pt-4">
+              <input
+                className="input input-bordered input-sm min-w-0 flex-1"
+                placeholder="新分组名称"
+                value={newGroupName}
+                maxLength={50}
+                disabled={groupBusy !== null}
+                onChange={(event) => setNewGroupName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') void createGroup()
+                }}
+              />
+              <button
+                type="button"
+                className="btn btn-neutral btn-sm"
+                disabled={groupBusy !== null || !newGroupName.trim()}
+                onClick={() => void createGroup()}
+              >
+                {groupBusy === 'new' ? <span className="loading loading-spinner loading-xs" /> : <PlusIcon className="size-4" />}
+                新建分组
+              </button>
+            </div>
+            {groupError && <p className="mt-3 text-sm text-error">{groupError}</p>}
+            <div className="modal-action">
+              <button type="button" className="btn" disabled={groupBusy !== null} onClick={() => setShowGroupManager(false)}>完成</button>
+            </div>
+          </div>
+          <button
+            type="button"
+            className="modal-backdrop cursor-default"
+            aria-label="关闭分组管理"
+            disabled={groupBusy !== null}
+            onClick={() => setShowGroupManager(false)}
+          />
+        </dialog>
+      )}
+
+      {groupDialog && (
+        <dialog className="modal modal-open" aria-labelledby="account-group-dialog-title">
+          <div className="modal-box max-w-md">
+            <h3 id="account-group-dialog-title" className="text-lg font-semibold">调整分组</h3>
+            <p className="mt-2 text-sm text-base-content/60">{groupDialog.email || `账号 ${groupDialog.id}`}</p>
+            <select
+              className="select select-bordered mt-5 w-full"
+              value={selectedGroupID}
+              disabled={updatingGroup}
+              onChange={(event) => setSelectedGroupID(Number(event.target.value))}
+            >
+              {groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}
+            </select>
+            {groupError && <p className="mt-3 text-sm text-error">{groupError}</p>}
+            <div className="modal-action">
+              <button type="button" className="btn" disabled={updatingGroup} onClick={() => setGroupDialog(null)}>取消</button>
+              <button
+                type="button"
+                className="btn btn-neutral"
+                disabled={updatingGroup || selectedGroupID === groupDialog.group_id}
+                onClick={() => void updateAccountGroup()}
+              >
+                {updatingGroup && <span className="loading loading-spinner loading-xs" />}
+                保存
+              </button>
+            </div>
+          </div>
+          <button
+            type="button"
+            className="modal-backdrop cursor-default"
+            aria-label="关闭调整分组"
+            disabled={updatingGroup}
+            onClick={() => setGroupDialog(null)}
+          />
+        </dialog>
       )}
 
       <ConfirmDialog

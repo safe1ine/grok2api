@@ -8,6 +8,18 @@ import (
 	"grok2api/server/internal/pool"
 )
 
+func TestAccountGroupName(t *testing.T) {
+	if name, ok := accountGroupName(" 生产账号 "); !ok || name != "生产账号" {
+		t.Fatalf("accountGroupName returned %q, %t", name, ok)
+	}
+	if _, ok := accountGroupName("   "); ok {
+		t.Fatal("blank group name should be invalid")
+	}
+	if _, ok := accountGroupName(string(make([]rune, 51))); ok {
+		t.Fatal("group name longer than 50 characters should be invalid")
+	}
+}
+
 func TestValidSchedulingWeight(t *testing.T) {
 	for _, tc := range []struct {
 		weight int
