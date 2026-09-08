@@ -250,6 +250,14 @@ func normalizeSchema(schema map[string]any, root bool) bool {
 	changed = normalizeChildSchemas(schema) || changed
 	if root {
 		changed = normalizeRootObjectSchema(schema, schema) || changed
+		// xAI 的 Anthropic 反序列化目标要求工具根 input_schema 显式包含 properties，
+		// 即使这是一个不接收参数的合法 JSON Schema object。
+		if schemaDirectlyRequiresObject(schema) {
+			if _, ok := schema["properties"].(map[string]any); !ok {
+				schema["properties"] = map[string]any{}
+				changed = true
+			}
+		}
 	}
 	// xAI 的 Anthropic 适配层会把缺失 required 的 object Schema 编码成 null，
 	// 随后又因 required 不是数组而拒绝请求，因此显式补空数组。

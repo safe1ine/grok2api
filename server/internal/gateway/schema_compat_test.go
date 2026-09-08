@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"testing"
 )
 
@@ -37,6 +38,36 @@ func TestNormalizeToolSchemasAnthropic(t *testing.T) {
 	nested := schema["properties"].(map[string]any)["options"].(map[string]any)
 	if required, ok := nested["required"].([]any); !ok || len(required) != 0 {
 		t.Fatalf("nested required = %#v, want empty array", nested["required"])
+	}
+}
+
+func TestNormalizeToolSchemasAddsMissingAnthropicRootProperties(t *testing.T) {
+	t.Parallel()
+
+	tools := make([]any, 43)
+	for index := range tools {
+		schema := map[string]any{"type": "object", "properties": map[string]any{"value": map[string]any{"type": "string"}}}
+		if index == 42 {
+			schema = map[string]any{"type": "object"}
+		}
+		tools[index] = map[string]any{"name": fmt.Sprintf("tool_%d", index), "description": "test", "input_schema": schema}
+	}
+	body, err := json.Marshal(map[string]any{"tools": tools})
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalized, changed := normalizeToolSchemas(body)
+	if !changed {
+		t.Fatal("expected missing root properties to be added")
+	}
+	payload := decodePayload(t, normalized)
+	schema := payload["tools"].([]any)[42].(map[string]any)["input_schema"].(map[string]any)
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok || len(properties) != 0 {
+		t.Fatalf("properties = %#v, want empty object", schema["properties"])
+	}
+	if required, ok := schema["required"].([]any); !ok || len(required) != 0 {
+		t.Fatalf("required = %#v, want empty array", schema["required"])
 	}
 }
 
