@@ -45,6 +45,7 @@ export interface KeyItem {
   name: string
   prefix: string
   revoked: boolean
+  has_secret: boolean
   historical_calls: number
   today_calls: number
   created_at: string

@@ -15,7 +15,10 @@ import (
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
-var ErrDefaultAccountGroup = errors.New("默认分组不能删除")
+var (
+	ErrDefaultAccountGroup  = errors.New("默认分组不能删除")
+	ErrKeySecretUnavailable = errors.New("历史密钥未保存明文，请重新生成")
+)
 
 type AccountRecord struct {
 	ID                 int64      `json:"id"`
@@ -55,6 +58,7 @@ type KeyRecord struct {
 	KeyHash         string    `json:"-"`
 	Prefix          string    `json:"prefix"`
 	Revoked         bool      `json:"revoked"`
+	HasSecret       bool      `json:"has_secret"`
 	HistoricalCalls int64     `json:"historical_calls"`
 	TodayCalls      int64     `json:"today_calls"`
 	CreatedAt       time.Time `json:"created_at"`
@@ -449,17 +453,22 @@ func (s *Store) CleanupExpiredOAuthStates(ctx context.Context) (int64, error) {
 
 // ---------- API Key ----------
 
-func (s *Store) CreateKey(ctx context.Context, name, keyHash, prefix string) (int64, error) {
+func (s *Store) CreateKey(ctx context.Context, name, plain, keyHash, prefix string) (int64, error) {
+	ciphertext, err := s.enc.Encrypt([]byte(plain))
+	if err != nil {
+		return 0, err
+	}
 	var id int64
-	err := s.pool.QueryRow(ctx, `
-		INSERT INTO api_keys (name, key_hash, prefix) VALUES ($1, $2, $3) RETURNING id`,
-		name, keyHash, prefix).Scan(&id)
+	err = s.pool.QueryRow(ctx, `
+		INSERT INTO api_keys (name, key_hash, prefix, key_ciphertext)
+		VALUES ($1, $2, $3, $4) RETURNING id`,
+		name, keyHash, prefix, ciphertext).Scan(&id)
 	return id, err
 }
 
 func (s *Store) ListKeys(ctx context.Context) ([]KeyRecord, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT k.id, k.name, k.key_hash, k.prefix, k.revoked,
+		SELECT k.id, k.name, k.key_hash, k.prefix, k.revoked, k.key_ciphertext IS NOT NULL,
 		       COALESCE(usage.historical_calls, 0), COALESCE(usage.today_calls, 0),
 		       k.created_at
 		FROM api_keys k
@@ -482,7 +491,7 @@ func (s *Store) ListKeys(ctx context.Context) ([]KeyRecord, error) {
 	for rows.Next() {
 		var k KeyRecord
 		if err := rows.Scan(
-			&k.ID, &k.Name, &k.KeyHash, &k.Prefix, &k.Revoked,
+			&k.ID, &k.Name, &k.KeyHash, &k.Prefix, &k.Revoked, &k.HasSecret,
 			&k.HistoricalCalls, &k.TodayCalls, &k.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -490,6 +499,39 @@ func (s *Store) ListKeys(ctx context.Context) ([]KeyRecord, error) {
 		out = append(out, k)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) RevealKey(ctx context.Context, id int64) (string, bool, error) {
+	var ciphertext []byte
+	if err := s.pool.QueryRow(ctx, `SELECT key_ciphertext FROM api_keys WHERE id = $1`, id).Scan(&ciphertext); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	if len(ciphertext) == 0 {
+		return "", true, ErrKeySecretUnavailable
+	}
+	plain, err := s.enc.Decrypt(ciphertext)
+	if err != nil {
+		return "", true, fmt.Errorf("密钥解密失败: %w", err)
+	}
+	return string(plain), true, nil
+}
+
+func (s *Store) RegenerateKey(ctx context.Context, id int64, plain, keyHash, prefix string) (bool, error) {
+	ciphertext, err := s.enc.Encrypt([]byte(plain))
+	if err != nil {
+		return false, err
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE api_keys
+		SET key_hash = $2, prefix = $3, key_ciphertext = $4
+		WHERE id = $1`, id, keyHash, prefix, ciphertext)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 func (s *Store) DeleteKey(ctx context.Context, id int64) error {

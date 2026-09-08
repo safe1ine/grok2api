@@ -190,6 +190,8 @@ func main() {
 			g.Delete("/accounts/{id}", h.DeleteAccount)
 			g.Get("/keys", h.ListKeys)
 			g.Post("/keys", h.CreateKey)
+			g.Get("/keys/{id}/secret", h.RevealKey)
+			g.Post("/keys/{id}/regenerate", h.RegenerateKey)
 			g.Delete("/keys/{id}", h.DeleteKey)
 			g.Get("/logs", h.ListLogs)
 			g.Get("/dashboard", h.Dashboard)

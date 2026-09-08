@@ -1,4 +1,4 @@
-import { CheckIcon, CopyIcon, PlusIcon, Trash2Icon } from 'lucide-react'
+import { CheckIcon, CopyIcon, EyeIcon, PlusIcon, RefreshCwIcon, Trash2Icon } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { api, type KeyItem } from '../api'
 import { ConfirmDialog, TextInputDialog } from '../components/Dialogs'
@@ -9,12 +9,15 @@ export default function Keys() {
   const [keys, setKeys] = useState<KeyItem[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
-  const [newKey, setNewKey] = useState<{ name: string; key: string } | null>(null)
+  const [keyView, setKeyView] = useState<{ name: string; key: string; regenerated?: boolean } | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
   const [keyName, setKeyName] = useState('')
   const [creating, setCreating] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<KeyItem | null>(null)
   const [deletingId, setDeletingId] = useState<number | null>(null)
+  const [revealingId, setRevealingId] = useState<number | null>(null)
+  const [regenerateTarget, setRegenerateTarget] = useState<KeyItem | null>(null)
+  const [regeneratingId, setRegeneratingId] = useState<number | null>(null)
 
   const load = useCallback(async (showLoading = true) => {
     if (showLoading) setLoading(true)
@@ -43,7 +46,7 @@ export default function Keys() {
         method: 'POST',
         body: JSON.stringify({ name }),
       })
-      setNewKey({ name: res.name, key: res.key })
+      setKeyView({ name: res.name, key: res.key })
       setCreateOpen(false)
       setKeyName('')
       await load()
@@ -51,6 +54,35 @@ export default function Keys() {
       setError(String(e))
     } finally {
       setCreating(false)
+    }
+  }
+
+  async function reveal(key: KeyItem) {
+    if (!key.has_secret || revealingId !== null) return
+    setRevealingId(key.id)
+    setError('')
+    try {
+      const result = await api<{ key: string }>(`/api/keys/${key.id}/secret`)
+      setKeyView({ name: key.name, key: result.key })
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setRevealingId(null)
+    }
+  }
+
+  async function regenerate(key: KeyItem) {
+    setRegeneratingId(key.id)
+    setError('')
+    try {
+      const result = await api<{ key: string }>(`/api/keys/${key.id}/regenerate`, { method: 'POST' })
+      setKeyView({ name: key.name, key: result.key, regenerated: true })
+      setRegenerateTarget(null)
+      await load()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setRegeneratingId(null)
     }
   }
 
@@ -129,14 +161,33 @@ export default function Keys() {
                   <td className="text-right tabular-nums">{callCountFormatter.format(k.today_calls)}</td>
                   <td>{new Date(k.created_at).toLocaleString()}</td>
                   <td>
-                    <button
-                      className="btn btn-error btn-xs"
-                      disabled={deletingId === k.id}
-                      onClick={() => setDeleteTarget(k)}
-                    >
-                      {deletingId === k.id ? <span className="loading loading-spinner loading-xs" /> : <Trash2Icon className="size-3.5" />}
-                      {deletingId === k.id ? '删除中' : '删除'}
-                    </button>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        className="btn btn-ghost btn-xs"
+                        title={k.has_secret ? '查看密钥' : '历史密钥未保存明文，请重新生成'}
+                        disabled={!k.has_secret || revealingId === k.id}
+                        onClick={() => void reveal(k)}
+                      >
+                        {revealingId === k.id ? <span className="loading loading-spinner loading-xs" /> : <EyeIcon className="size-3.5" />}
+                        {k.has_secret ? '查看' : '不可查看'}
+                      </button>
+                      <button
+                        className="btn btn-ghost btn-xs"
+                        disabled={regeneratingId === k.id}
+                        onClick={() => setRegenerateTarget(k)}
+                      >
+                        {regeneratingId === k.id ? <span className="loading loading-spinner loading-xs" /> : <RefreshCwIcon className="size-3.5" />}
+                        重新生成
+                      </button>
+                      <button
+                        className="btn btn-error btn-xs"
+                        disabled={deletingId === k.id}
+                        onClick={() => setDeleteTarget(k)}
+                      >
+                        {deletingId === k.id ? <span className="loading loading-spinner loading-xs" /> : <Trash2Icon className="size-3.5" />}
+                        {deletingId === k.id ? '删除中' : '删除'}
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))
@@ -163,6 +214,19 @@ export default function Keys() {
       />
 
       <ConfirmDialog
+        open={regenerateTarget !== null}
+        title="重新生成 Key？"
+        description={regenerateTarget ? `重新生成 ${regenerateTarget.name} 后，旧 Key 会立即失效，所有调用方都必须更换为新 Key。` : ''}
+        confirmLabel="重新生成"
+        tone="danger"
+        pending={regeneratingId !== null}
+        onClose={() => setRegenerateTarget(null)}
+        onConfirm={() => {
+          if (regenerateTarget) void regenerate(regenerateTarget)
+        }}
+      />
+
+      <ConfirmDialog
         open={deleteTarget !== null}
         title="删除 Key？"
         description={deleteTarget ? `确定删除 ${deleteTarget.name}？删除后该 Key 立即失效。` : ''}
@@ -175,25 +239,29 @@ export default function Keys() {
         }}
       />
 
-      {newKey && (
+      {keyView && (
         <div className="modal modal-open">
           <div className="modal-box">
-            <h3 className="font-bold text-lg mb-2">Key 创建成功</h3>
-            <p className="text-sm mb-4">请立即保存，明文只显示这一次：</p>
+            <h3 className="mb-2 text-lg font-bold">{keyView.regenerated ? 'Key 已重新生成' : '查看 Key'}</h3>
+            <p className="mb-4 text-sm">
+              {keyView.regenerated
+                ? '旧 Key 已立即失效，请更新所有调用方。'
+                : `${keyView.name} 的完整密钥：`}
+            </p>
             <div className="flex gap-2">
-              <input className="input input-bordered flex-1 font-mono" readOnly value={newKey.key} />
+              <input className="input input-bordered min-w-0 flex-1 font-mono" readOnly value={keyView.key} />
               <button
                 className="btn btn-outline"
-                onClick={() => navigator.clipboard.writeText(newKey.key)}
+                onClick={() => navigator.clipboard.writeText(keyView.key)}
               >
                 <CopyIcon className="size-4" />
                 复制
               </button>
             </div>
             <div className="modal-action">
-              <button className="btn btn-neutral" onClick={() => setNewKey(null)}>
+              <button className="btn btn-neutral" onClick={() => setKeyView(null)}>
                 <CheckIcon className="size-4" />
-                我已保存
+                关闭
               </button>
             </div>
           </div>

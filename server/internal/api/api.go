@@ -608,6 +608,15 @@ func (h *Handler) ListKeys(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, keys)
 }
 
+func newAPIKey() (plain, hash, prefix string, err error) {
+	raw := make([]byte, 24)
+	if _, err = rand.Read(raw); err != nil {
+		return "", "", "", err
+	}
+	plain = "sk-grok2api-" + hex.EncodeToString(raw)
+	return plain, auth.HashKey(plain), plain[:16], nil
+}
+
 func (h *Handler) CreateKey(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Name string `json:"name"`
@@ -617,18 +626,70 @@ func (h *Handler) CreateKey(w http.ResponseWriter, r *http.Request) {
 		in.Name = "default"
 	}
 
-	raw := make([]byte, 24)
-	_, _ = rand.Read(raw)
-	plain := "sk-grok2api-" + hex.EncodeToString(raw)
-	hash := auth.HashKey(plain)
-
-	id, err := h.store.CreateKey(r.Context(), in.Name, hash, plain[:16])
+	plain, hash, prefix, err := newAPIKey()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "生成密钥失败")
+		return
+	}
+	id, err := h.store.CreateKey(r.Context(), in.Name, plain, hash, prefix)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	_ = h.keys.Reload(r.Context())
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "name": in.Name, "key": plain})
+}
+
+func (h *Handler) RevealKey(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "无效的 key id")
+		return
+	}
+	plain, found, err := h.store.RevealKey(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrKeySecretUnavailable) {
+			writeErr(w, http.StatusConflict, err.Error())
+		} else {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, "Key 不存在")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]string{"key": plain})
+}
+
+func (h *Handler) RegenerateKey(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "无效的 key id")
+		return
+	}
+	plain, hash, prefix, err := newAPIKey()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "生成密钥失败")
+		return
+	}
+	found, err := h.store.RegenerateKey(r.Context(), id, plain, hash, prefix)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, "Key 不存在")
+		return
+	}
+	if err := h.keys.Reload(r.Context()); err != nil {
+		writeErr(w, http.StatusInternalServerError, "刷新密钥缓存失败")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]string{"key": plain})
 }
 
 func (h *Handler) DeleteKey(w http.ResponseWriter, r *http.Request) {
