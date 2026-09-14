@@ -3,14 +3,10 @@ package pool
 import (
 	"context"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
-	"strconv"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -474,103 +470,6 @@ func TestRefreshBillingRecoversExhaustedAccountWhenUsageIsOmitted(t *testing.T) 
 	state, _ := p.AccountState(1)
 	if state.Status != StatusActive || state.CooldownUntil != nil {
 		t.Fatalf("state = %+v, want active", state)
-	}
-}
-
-func TestRefreshBillingPreservesResetCreditsWhenSupplementalLookupFails(t *testing.T) {
-	var failResets atomic.Bool
-	now := time.Now().UTC().Truncate(time.Second)
-	resetResponse := poolResetResponse(map[string]time.Time{"reset-token": now.Add(48 * time.Hour)})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/billing":
-			_, _ = w.Write([]byte(`{"config":{"creditUsagePercent":15,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-08-31T08:12:21Z"}}}`))
-		case "/settings":
-			_, _ = w.Write([]byte(`{"subscription_tier_display":"SuperGrok Heavy"}`))
-		case "/prod_mc_billing.ConsumerUiSvc/GetRemainingResets":
-			if failResets.Load() {
-				http.Error(w, "temporary", http.StatusServiceUnavailable)
-				return
-			}
-			_, _ = w.Write(resetResponse)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	p := New(nil, nil)
-	p.AddAccount(1, "a@x.com", "refresh")
-	p.byID[1].AccessToken = "access"
-	p.byID[1].ExpiresAt = time.Now().Add(time.Hour)
-	p.SetBillingClient(billing.New(server.URL, server.URL))
-	p.RefreshBilling(context.Background())
-	before, _ := p.BillingUsage(1)
-	if len(before.AvailableResetCredits(now)) != 1 || before.ResetCreditsUpdatedAt.IsZero() {
-		t.Fatalf("before = %+v", before)
-	}
-
-	failResets.Store(true)
-	p.RefreshBilling(context.Background())
-	after, _ := p.BillingUsage(1)
-	if !reflect.DeepEqual(after.ResetCredits, before.ResetCredits) || !after.ResetCreditsUpdatedAt.Equal(before.ResetCreditsUpdatedAt) {
-		t.Fatalf("reset credits were replaced: before=%+v after=%+v", before, after)
-	}
-}
-
-func TestRedeemResetUsesSoonestCreditAndRefreshesUsage(t *testing.T) {
-	var redeemed atomic.Bool
-	now := time.Now().UTC().Truncate(time.Second)
-	resetResponse := poolResetResponse(map[string]time.Time{
-		"later-token": now.Add(5 * 24 * time.Hour),
-		"soon-token":  now.Add(2 * 24 * time.Hour),
-	})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/billing":
-			used := 15
-			if redeemed.Load() {
-				used = 0
-			}
-			_, _ = w.Write([]byte(`{"config":{"creditUsagePercent":` + strconv.Itoa(used) + `,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-08-31T08:12:21Z"}}}`))
-		case "/settings":
-			_, _ = w.Write([]byte(`{"subscription_tier_display":"SuperGrok Heavy"}`))
-		case "/prod_mc_billing.ConsumerUiSvc/GetRemainingResets":
-			if redeemed.Load() {
-				_, _ = w.Write(poolGRPCResponse(nil))
-			} else {
-				_, _ = w.Write(resetResponse)
-			}
-		case "/prod_mc_billing.ConsumerUiSvc/RedeemReset":
-			body, _ := io.ReadAll(r.Body)
-			if !strings.Contains(string(body), "soon-token") || strings.Contains(string(body), "later-token") {
-				t.Errorf("redeem body = %x", body)
-			}
-			redeemed.Store(true)
-			w.Header().Set("grpc-status", "0")
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	p := New(nil, nil)
-	p.AddAccount(1, "a@x.com", "refresh")
-	p.byID[1].AccessToken = "access"
-	p.byID[1].ExpiresAt = time.Now().Add(time.Hour)
-	p.SetBillingClient(billing.New(server.URL, server.URL))
-	p.RefreshBilling(context.Background())
-
-	before, ok := p.BillingUsage(1)
-	if !ok || len(before.AvailableResetCredits(now)) != 2 {
-		t.Fatalf("before = %+v, ok = %t", before, ok)
-	}
-	usage, err := p.RedeemReset(context.Background(), 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !redeemed.Load() || usage.WeeklyUsedPercent != 0 || len(usage.AvailableResetCredits(time.Now())) != 0 {
-		t.Fatalf("usage after redeem = %+v, redeemed = %t", usage, redeemed.Load())
 	}
 }
 

@@ -136,13 +136,6 @@ func (c *Client) FetchForUser(ctx context.Context, accessToken, userID string) (
 		usage.SubscriptionTier = settings.SubscriptionTierDisplay
 	}
 
-	// 重置券是附加能力：查询失败不能影响周用量，也不能把最后一次成功结果覆盖成 0。
-	if credits, err := c.FetchResetCreditsForUser(ctx, accessToken, userID); err == nil {
-		usage.ResetCredits = credits
-		usage.ResetCreditsUpdatedAt = now
-	} else {
-		usage.ResetCreditsError = err.Error()
-	}
 	return usage, nil
 }
 

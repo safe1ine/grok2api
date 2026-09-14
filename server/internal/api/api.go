@@ -322,12 +322,9 @@ func (h *Handler) pollDevice(flow *deviceFlow) {
 
 type accountView struct {
 	store.AccountRecord
-	SubscriptionTier      string     `json:"subscription_tier"`
-	WeeklyUsedPercent     *float64   `json:"weekly_used_percent"`
-	WeeklyResetAt         *time.Time `json:"weekly_reset_at"`
-	ResetCreditsKnown     bool       `json:"reset_credits_known"`
-	ResetCreditsAvailable int        `json:"reset_credits_available"`
-	ResetCreditExpiresAt  *time.Time `json:"reset_credit_expires_at"`
+	SubscriptionTier  string     `json:"subscription_tier"`
+	WeeklyUsedPercent *float64   `json:"weekly_used_percent"`
+	WeeklyResetAt     *time.Time `json:"weekly_reset_at"`
 }
 
 func applyAccountState(v *accountView, state pool.AccountState) {
@@ -340,15 +337,6 @@ func applyAccountUsage(v *accountView, usage billing.Usage) {
 	v.WeeklyUsedPercent = &usage.WeeklyUsedPercent
 	if !usage.WeeklyResetAt.IsZero() {
 		v.WeeklyResetAt = &usage.WeeklyResetAt
-	}
-	v.ResetCreditsKnown = !usage.ResetCreditsUpdatedAt.IsZero()
-	if !v.ResetCreditsKnown {
-		return
-	}
-	available := usage.AvailableResetCredits(time.Now())
-	v.ResetCreditsAvailable = len(available)
-	if len(available) > 0 && !available[0].ExpiresAt.IsZero() {
-		v.ResetCreditExpiresAt = &available[0].ExpiresAt
 	}
 }
 
@@ -498,32 +486,6 @@ func (h *Handler) UpdateAccountGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-func (h *Handler) RedeemAccountReset(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "无效的账号 id")
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
-	defer cancel()
-	usage, err := h.pool.RedeemReset(ctx, id)
-	if err != nil {
-		switch {
-		case errors.Is(err, pool.ErrAccountNotFound):
-			writeErr(w, http.StatusNotFound, err.Error())
-		case errors.Is(err, billing.ErrNoResetCredit):
-			writeErr(w, http.StatusConflict, err.Error())
-		default:
-			writeErr(w, http.StatusBadGateway, "重置周限失败："+err.Error())
-		}
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":                  true,
-		"weekly_used_percent": usage.WeeklyUsedPercent,
-	})
 }
 
 func (h *Handler) DisableAccount(w http.ResponseWriter, r *http.Request) {

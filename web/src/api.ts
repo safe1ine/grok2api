@@ -28,9 +28,6 @@ export interface Account {
   subscription_tier: string
   weekly_used_percent: number | null
   weekly_reset_at: string | null
-  reset_credits_known: boolean
-  reset_credits_available: number
-  reset_credit_expires_at: string | null
 }
 
 export interface AccountGroup {

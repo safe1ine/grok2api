@@ -1,4 +1,4 @@
-import { CheckIcon, ChevronDownIcon, ChevronRightIcon, CopyIcon, EllipsisIcon, ExternalLinkIcon, FolderCogIcon, FolderInputIcon, PencilIcon, PlusIcon, PowerIcon, PowerOffIcon, RotateCcwIcon, SlidersHorizontalIcon, Trash2Icon, XIcon } from 'lucide-react'
+import { CheckIcon, ChevronDownIcon, ChevronRightIcon, CopyIcon, EllipsisIcon, ExternalLinkIcon, FolderCogIcon, FolderInputIcon, PencilIcon, PlusIcon, PowerIcon, PowerOffIcon, SlidersHorizontalIcon, Trash2Icon, XIcon } from 'lucide-react'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { api, type Account, type AccountGroup } from '../api'
@@ -15,50 +15,7 @@ function statusBadge(status: string) {
   return map[status] || 'badge-ghost'
 }
 
-const resetTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
-  timeZone: 'Asia/Shanghai',
-  month: '2-digit',
-  day: '2-digit',
-  hour: '2-digit',
-  minute: '2-digit',
-  hour12: false,
-})
-
-const minuteMs = 60 * 1000
-const hourMs = 60 * minuteMs
-const dayMs = 24 * hourMs
-const resetCreditWarningWindowMs = 3 * dayMs
-
-function formatResetCountdown(value: string) {
-  const remaining = new Date(value).getTime() - Date.now()
-  if (!Number.isFinite(remaining)) return '-'
-  if (remaining <= 0) return '即将重置'
-  if (remaining >= dayMs) return `${Math.floor(remaining / dayMs)} 天后重置`
-  if (remaining >= hourMs) return `${Math.floor(remaining / hourMs)} 小时后重置`
-  if (remaining >= minuteMs) return `${Math.floor(remaining / minuteMs)} 分钟后重置`
-  return '1 分钟内重置'
-}
-
-function resetCreditState(account: Account) {
-  const expiresAt = account.reset_credit_expires_at
-    ? new Date(account.reset_credit_expires_at).getTime()
-    : null
-  const expiresIn = expiresAt === null ? null : expiresAt - Date.now()
-  const available = account.reset_credits_available > 0 && (expiresIn === null || expiresIn > 0)
-  return {
-    available,
-    expiringSoon: available && expiresIn !== null && expiresIn <= resetCreditWarningWindowMs,
-    title: !account.reset_credits_known
-      ? '重置状态暂无'
-      : !available
-        ? '暂无重置次数'
-        : expiresAt === null
-          ? `有 ${account.reset_credits_available} 次重置`
-          : `有 ${account.reset_credits_available} 次重置，过期时间：${resetTimeFormatter.format(new Date(expiresAt))}`,
-  }
-}
-
-type AccountDialog = { kind: 'redeem' | 'disable' | 'enable' | 'delete'; account: Account }
+type AccountDialog = { kind: 'disable' | 'enable' | 'delete'; account: Account }
 type AccountMenu = { account: Account; top: number; left: number }
 type GroupDropdown = { top: number; left: number; width: number }
 
@@ -113,7 +70,6 @@ export default function Accounts() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
-  const [redeemingId, setRedeemingId] = useState<number | null>(null)
   const [togglingId, setTogglingId] = useState<number | null>(null)
   const [updatingWeightId, setUpdatingWeightId] = useState<number | null>(null)
   const [weightDialog, setWeightDialog] = useState<Account | null>(null)
@@ -280,26 +236,6 @@ export default function Accounts() {
     setFlowState('')
   }
 
-  async function redeemReset(account: Account) {
-    const state = resetCreditState(account)
-    if (!state.available || redeemingId !== null) return
-    setRedeemingId(account.id)
-    setError('')
-    setSuccess('')
-    try {
-      await api(`/api/accounts/${account.id}/redeem-reset`, { method: 'POST' })
-      setSuccess(`${account.email || `账号 ${account.id}`} 的周限已重置`)
-      await load()
-    } catch (e) {
-      const message = String(e)
-      await load()
-      setError(message)
-    } finally {
-      setRedeemingId(null)
-      setAccountDialog(null)
-    }
-  }
-
   async function setSchedulingDisabled(account: Account, disabled: boolean) {
     setTogglingId(account.id)
     setError('')
@@ -461,7 +397,6 @@ export default function Accounts() {
     group,
     accounts: accounts.filter((account) => account.group_id === group.id),
   }))
-  const menuResetCredit = accountMenu ? resetCreditState(accountMenu.account) : null
 
   return (
     <section className="grid gap-6">
@@ -497,28 +432,26 @@ export default function Accounts() {
               <th>权重</th>
               <th>会员等级</th>
               <th>周限用量</th>
-              <th>重置次数</th>
-              <th>重置时间</th>
               <th>操作</th>
             </tr>
           </thead>
           <tbody>
             {loading ? (
               <tr>
-                <td colSpan={9} className="text-center">
+                <td colSpan={7} className="text-center">
                   <span className="loading loading-spinner" />
                 </td>
               </tr>
             ) : accounts.length === 0 ? (
               <tr>
-                <td colSpan={9} className="text-center text-base-content/50">
+                <td colSpan={7} className="text-center text-base-content/50">
                   还没有账号，点击右上角添加
                 </td>
               </tr>
             ) : (
               groupedAccounts.flatMap(({ group, accounts: groupAccounts }) => [
                 <tr key={`group-${group.id}`} className="bg-base-200/70">
-                  <td colSpan={9} className="p-0">
+                  <td colSpan={7} className="p-0">
                     <button
                       type="button"
                       className="flex w-full items-center gap-2 px-4 py-3 text-left font-medium hover:bg-base-200"
@@ -536,11 +469,10 @@ export default function Accounts() {
                 </tr>,
                 ...(collapsedGroups.has(group.id) ? [] : groupAccounts.map((a) => {
                 const weeklyUsed = a.weekly_used_percent
-                const redeeming = redeemingId === a.id
                 const toggling = togglingId === a.id
                 const updatingWeight = updatingWeightId === a.id
                 const deleting = deletingId === a.id
-                const busy = redeeming || toggling || updatingWeight || deleting
+                const busy = toggling || updatingWeight || deleting
                 return (
                   <tr key={a.id}>
                     <td>{a.id}</td>
@@ -565,12 +497,6 @@ export default function Accounts() {
                       ) : (
                         <span className="text-base-content/40">-</span>
                       )}
-                    </td>
-                    <td className="tabular-nums">
-                      {a.reset_credits_known ? a.reset_credits_available : <span className="text-base-content/40">未知</span>}
-                    </td>
-                    <td className="whitespace-nowrap tabular-nums">
-                      {a.weekly_reset_at ? formatResetCountdown(a.weekly_reset_at) : '-'}
                     </td>
                     <td>
                       <button
@@ -602,7 +528,7 @@ export default function Accounts() {
         </div>
       </div>
 
-      {accountMenu && menuResetCredit && createPortal(
+      {accountMenu && createPortal(
         <ul
           ref={accountMenuRef}
           role="menu"
@@ -650,22 +576,6 @@ export default function Accounts() {
             >
               {accountMenu.account.scheduling_disabled ? <PowerIcon className="size-4" /> : <PowerOffIcon className="size-4" />}
               {accountMenu.account.scheduling_disabled ? '启用账号' : '禁用账号'}
-            </button>
-          </li>
-          <li>
-            <button
-              type="button"
-              role="menuitem"
-              title={menuResetCredit.title}
-              onClick={() => {
-                const account = accountMenu.account
-                setAccountMenu(null)
-                setAccountDialog({ kind: 'redeem', account })
-              }}
-            >
-              <RotateCcwIcon className="size-4" />
-              重置周限
-              {menuResetCredit.available && <span className="badge badge-sm">{accountMenu.account.reset_credits_available}</span>}
             </button>
           </li>
           <li>
@@ -860,48 +770,21 @@ export default function Accounts() {
 
       <ConfirmDialog
         open={accountDialog !== null}
-        title={accountDialog?.kind === 'redeem'
-          ? '重置周限？'
-          : accountDialog?.kind === 'disable'
-            ? '禁用账号？'
-            : accountDialog?.kind === 'enable'
-              ? '启用账号？'
-              : '删除账号？'}
-        description={accountDialog?.kind === 'redeem' ? (
-          <>
-            将查询 {accountDialog.account.email || `账号 ${accountDialog.account.id}`} 当前可用的重置机会并尝试重置
-            {accountDialog.account.reset_credits_known && accountDialog.account.reset_credits_available > 0
-              ? `，成功后剩余次数为 ${accountDialog.account.reset_credits_available - 1}。`
-              : '。'}
-            {accountDialog.account.reset_credit_expires_at && (
-              <><br />最近过期时间：{resetTimeFormatter.format(new Date(accountDialog.account.reset_credit_expires_at))}。</>
-            )}
-          </>
-        ) : accountDialog?.kind === 'disable'
+        title={accountDialog?.kind === 'disable' ? '禁用账号？' : accountDialog?.kind === 'enable' ? '启用账号？' : '删除账号？'}
+        description={accountDialog?.kind === 'disable'
           ? `禁用 ${accountDialog.account.email || `账号 ${accountDialog.account.id}`} 后将不再分配新请求，正在处理的请求不会中断。`
           : accountDialog?.kind === 'enable'
             ? `启用 ${accountDialog.account.email || `账号 ${accountDialog.account.id}`} 后将重新允许参与调度，实际可用状态仍取决于额度和登录状态。`
             : accountDialog
               ? `确定删除 ${accountDialog.account.email || `账号 ${accountDialog.account.id}`}？删除后需要重新授权才能恢复。`
               : ''}
-        confirmLabel={accountDialog?.kind === 'redeem'
-          ? '立即重置'
-          : accountDialog?.kind === 'disable'
-            ? '确认禁用'
-            : accountDialog?.kind === 'enable'
-              ? '确认启用'
-              : '删除账号'}
+        confirmLabel={accountDialog?.kind === 'disable' ? '确认禁用' : accountDialog?.kind === 'enable' ? '确认启用' : '删除账号'}
         tone={accountDialog?.kind === 'delete' ? 'danger' : accountDialog?.kind === 'enable' ? 'neutral' : 'warning'}
-        pending={accountDialog?.kind === 'redeem'
-          ? redeemingId !== null
-          : accountDialog?.kind === 'disable' || accountDialog?.kind === 'enable'
-            ? togglingId !== null
-            : deletingId !== null}
+        pending={accountDialog?.kind === 'disable' || accountDialog?.kind === 'enable' ? togglingId !== null : deletingId !== null}
         onClose={() => setAccountDialog(null)}
         onConfirm={() => {
           if (!accountDialog) return
-          if (accountDialog.kind === 'redeem') void redeemReset(accountDialog.account)
-          else if (accountDialog.kind === 'disable') void setSchedulingDisabled(accountDialog.account, true)
+          if (accountDialog.kind === 'disable') void setSchedulingDisabled(accountDialog.account, true)
           else if (accountDialog.kind === 'enable') void setSchedulingDisabled(accountDialog.account, false)
           else void remove(accountDialog.account)
         }}
