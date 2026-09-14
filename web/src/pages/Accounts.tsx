@@ -4,6 +4,20 @@ import { createPortal } from 'react-dom'
 import { api, type Account, type AccountGroup } from '../api'
 import { ConfirmDialog } from '../components/Dialogs'
 
+const minuteMs = 60 * 1000
+const hourMs = 60 * minuteMs
+const dayMs = 24 * hourMs
+
+function formatResetCountdown(value: string) {
+  const remaining = new Date(value).getTime() - Date.now()
+  if (!Number.isFinite(remaining)) return '-'
+  if (remaining <= 0) return '即将重置'
+  if (remaining >= dayMs) return `${Math.floor(remaining / dayMs)} 天后重置`
+  if (remaining >= hourMs) return `${Math.floor(remaining / hourMs)} 小时后重置`
+  if (remaining >= minuteMs) return `${Math.floor(remaining / minuteMs)} 分钟后重置`
+  return '1 分钟内重置'
+}
+
 function statusBadge(status: string) {
   const map: Record<string, string> = {
     active: 'badge-success',
@@ -432,26 +446,27 @@ export default function Accounts() {
               <th>权重</th>
               <th>会员等级</th>
               <th>周限用量</th>
+              <th>下次重置</th>
               <th>操作</th>
             </tr>
           </thead>
           <tbody>
             {loading ? (
               <tr>
-                <td colSpan={7} className="text-center">
+                <td colSpan={8} className="text-center">
                   <span className="loading loading-spinner" />
                 </td>
               </tr>
             ) : accounts.length === 0 ? (
               <tr>
-                <td colSpan={7} className="text-center text-base-content/50">
+                <td colSpan={8} className="text-center text-base-content/50">
                   还没有账号，点击右上角添加
                 </td>
               </tr>
             ) : (
               groupedAccounts.flatMap(({ group, accounts: groupAccounts }) => [
                 <tr key={`group-${group.id}`} className="bg-base-200/70">
-                  <td colSpan={7} className="p-0">
+                  <td colSpan={8} className="p-0">
                     <button
                       type="button"
                       className="flex w-full items-center gap-2 px-4 py-3 text-left font-medium hover:bg-base-200"
@@ -497,6 +512,9 @@ export default function Accounts() {
                       ) : (
                         <span className="text-base-content/40">-</span>
                       )}
+                    </td>
+                    <td className="whitespace-nowrap tabular-nums">
+                      {a.weekly_reset_at ? formatResetCountdown(a.weekly_reset_at) : '-'}
                     </td>
                     <td>
                       <button
