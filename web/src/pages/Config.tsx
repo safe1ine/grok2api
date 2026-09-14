@@ -13,6 +13,12 @@ type FallbackConfig = {
 
 type Provider = 'openai' | 'anthropic'
 
+type FallbackUsage = {
+  historical_calls: number
+  today_calls: number
+  daily: Array<{ day: string; calls: number }>
+}
+
 const emptyConfig: FallbackConfig = {
   openai_base_url: '', openai_model: '', openai_key_set: false,
   anthropic_base_url: '', anthropic_model: '', anthropic_key_set: false,
@@ -25,12 +31,17 @@ export default function Config() {
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
+  const [usage, setUsage] = useState<FallbackUsage>({ historical_calls: 0, today_calls: 0, daily: [] })
+  const [checking, setChecking] = useState<Provider | null>(null)
 
   useEffect(() => {
-    void api<FallbackConfig>('/api/config/fallback')
-      .then(setConfig)
-      .catch((e) => setError(String(e)))
-      .finally(() => setLoading(false))
+    void Promise.all([
+      api<FallbackConfig>('/api/config/fallback'),
+      api<FallbackUsage>('/api/config/fallback/usage'),
+    ]).then(([nextConfig, nextUsage]) => {
+      setConfig(nextConfig)
+      setUsage(nextUsage)
+    }).catch((e) => setError(String(e))).finally(() => setLoading(false))
   }, [])
 
   function setValue(field: keyof FallbackConfig, value: string) {
@@ -61,6 +72,22 @@ export default function Config() {
       setError(String(e))
     } finally {
       setSaving(false)
+    }
+  }
+
+  async function check(provider: Provider) {
+    setChecking(provider)
+    setMessage('')
+    setError('')
+    try {
+      const result = await api<{ model: string }>('/api/config/fallback/check', {
+        method: 'POST', body: JSON.stringify({ provider }),
+      })
+      setMessage(`${provider === 'openai' ? 'OpenAI' : 'Anthropic'} fallback 模型 ${result.model} 工作正常`)
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setChecking(null)
     }
   }
 
@@ -105,9 +132,15 @@ export default function Config() {
               onChange={(e) => setKeys((current) => ({ ...current, [provider]: e.target.value }))}
             />
           </label>
-          <div className="flex items-center gap-2 text-xs text-base-content/60">
-            <ShieldCheckIcon className="size-4" />
-            <span>{keyConfigured ? 'API Key 已加密保存' : '尚未配置 API Key'}</span>
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-xs text-base-content/60">
+              <ShieldCheckIcon className="size-4" />
+              <span>{keyConfigured ? 'API Key 已加密保存' : '尚未配置 API Key'}</span>
+            </div>
+            <button className="btn btn-outline btn-sm" disabled={checking !== null} onClick={() => void check(provider)}>
+              {checking === provider && <span className="loading loading-spinner loading-xs" />}
+              检查模型
+            </button>
           </div>
         </div>
       </div>
@@ -124,6 +157,19 @@ export default function Config() {
       </header>
       <div className="alert alert-info text-sm">
         <span>429 不会触发 fallback。Fallback 不经过 Grok 兼容转换，只替换配置的模型名称和认证 Key。</span>
+      </div>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <div className="stat rounded-box border border-base-300 bg-base-100"><div className="stat-title">Fallback 历史调用</div><div className="stat-value text-3xl">{usage.historical_calls.toLocaleString()}</div></div>
+        <div className="stat rounded-box border border-base-300 bg-base-100"><div className="stat-title">Fallback 今日调用</div><div className="stat-value text-3xl">{usage.today_calls.toLocaleString()}</div></div>
+      </div>
+      <div className="card border border-base-300 bg-base-100 shadow-sm">
+        <div className="card-body"><h2 className="card-title text-base">近 30 天趋势</h2>
+          {usage.daily.length === 0 ? <p className="text-sm text-base-content/50">暂无 fallback 调用</p> : (
+            <div className="flex h-36 items-end gap-1 overflow-x-auto pt-4">
+              {usage.daily.map((point) => { const max = Math.max(...usage.daily.map((item) => item.calls), 1); return <div key={point.day} className="group flex min-w-5 flex-1 flex-col items-center justify-end gap-1" title={`${new Date(point.day).toLocaleDateString()}：${point.calls} 次`}><span className="text-[10px] opacity-0 group-hover:opacity-70">{point.calls}</span><div className="w-full rounded-t bg-neutral" style={{ height: `${Math.max(4, point.calls / max * 100)}px` }} /></div> })}
+            </div>
+          )}
+        </div>
       </div>
       <div className="grid gap-4 lg:grid-cols-2">
         {providerCard('openai', 'OpenAI fallback', '用于 OpenAI 兼容请求，直接透传请求和响应。')}

@@ -373,6 +373,19 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
+func (h *Handler) GetFallbackUsage(w http.ResponseWriter, r *http.Request) {
+	usage, err := h.store.FallbackUsage(r.Context(), 30)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"historical_calls": usage.HistoricalCalls,
+		"today_calls":      usage.TodayCalls,
+		"daily":            usage.Daily,
+	})
+}
+
 func (h *Handler) GetFallbackConfig(w http.ResponseWriter, r *http.Request) {
 	config, err := h.store.GetFallbackConfig(r.Context())
 	if err != nil {

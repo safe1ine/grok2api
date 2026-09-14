@@ -180,6 +180,8 @@ func main() {
 			g.Get("/accounts", h.ListAccounts)
 			g.Get("/config/fallback", h.GetFallbackConfig)
 			g.Put("/config/fallback", h.UpdateFallbackConfig)
+			g.Get("/config/fallback/usage", h.GetFallbackUsage)
+			g.Post("/config/fallback/check", gw.CheckFallback)
 			g.Get("/account-groups", h.ListAccountGroups)
 			g.Post("/account-groups", h.CreateAccountGroup)
 			g.Put("/account-groups/{id}", h.RenameAccountGroup)

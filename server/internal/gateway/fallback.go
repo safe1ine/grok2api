@@ -2,8 +2,11 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -49,6 +52,59 @@ func replaceFallbackModel(body []byte, model string) []byte {
 	return encoded
 }
 
+func (g *Gateway) CheckFallback(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Provider string `json:"provider"`
+	}
+	if json.NewDecoder(r.Body).Decode(&input) != nil || (input.Provider != "openai" && input.Provider != "anthropic") {
+		g.writeError(w, http.StatusBadRequest, "provider 必须是 openai 或 anthropic")
+		return
+	}
+	config, err := g.store.GetFallbackConfig(r.Context())
+	if err != nil {
+		g.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	baseURL, key, model, path := config.OpenAIBaseURL, config.OpenAIKey, config.OpenAIModel, "/v1/chat/completions"
+	payload := map[string]any{"model": model, "messages": []map[string]string{{"role": "user", "content": "Reply OK."}}, "max_tokens": 1, "stream": false}
+	if input.Provider == "anthropic" {
+		baseURL, key, model, path = config.AnthropicBaseURL, config.AnthropicKey, config.AnthropicModel, "/v1/messages"
+		payload = map[string]any{"model": model, "messages": []map[string]string{{"role": "user", "content": "Reply OK."}}, "max_tokens": 1, "stream": false}
+	}
+	if baseURL == "" || key == "" || model == "" {
+		g.writeError(w, http.StatusBadRequest, "该 fallback 配置不完整")
+		return
+	}
+	body, _ := json.Marshal(payload)
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fallbackTarget(baseURL, path), bytes.NewReader(body))
+	if err != nil {
+		g.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if input.Provider == "anthropic" {
+		req.Header.Set("x-api-key", key)
+		req.Header.Set("anthropic-version", "2023-06-01")
+	} else {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	resp, err := g.http.Do(req)
+	if err != nil {
+		g.writeError(w, http.StatusBadGateway, "检查请求失败: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		g.writeError(w, http.StatusBadGateway, "fallback 上游返回 HTTP "+strconv.Itoa(resp.StatusCode))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "provider": input.Provider, "model": model})
+}
+
 func (g *Gateway) proxyFallback(w http.ResponseWriter, r *http.Request, provider string, body []byte, start time.Time, requestMetrics responseMetrics) bool {
 	if g.store == nil {
 		return false
@@ -85,17 +141,17 @@ func (g *Gateway) proxyFallback(w http.ResponseWriter, r *http.Request, provider
 	if err != nil {
 		g.writeError(w, http.StatusBadGateway, "fallback 上游请求失败: "+err.Error())
 		requestMetrics.ErrorReason = "fallback 上游请求失败"
-		g.log(r, nil, model, path, http.StatusBadGateway, start, requestMetrics)
+		g.logFallback(r, model, path, http.StatusBadGateway, start, requestMetrics)
 		return true
 	}
 	defer response.Body.Close()
 	copyHeaders(w.Header(), response.Header, excludeRespHeaders)
 	w.WriteHeader(response.StatusCode)
-	metrics := streamCopyWithCompatibility(w, response.Body, response.Header.Get("Content-Type"), namespaceToolMappings{}, start, streamCompatibilityOptions{})
-	metrics.Stream = requestMetrics.Stream
+	g.streamCopy(w, response.Body)
+	metrics := responseMetrics{Stream: requestMetrics.Stream}
 	if response.StatusCode >= 400 {
 		metrics.ErrorReason = "fallback 上游错误"
 	}
-	g.log(r, nil, model, path, response.StatusCode, start, metrics)
+	g.logFallback(r, model, path, response.StatusCode, start, metrics)
 	return true
 }

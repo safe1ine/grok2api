@@ -738,6 +738,22 @@ func (g *Gateway) log(
 	start time.Time,
 	metrics responseMetrics,
 ) {
+	g.logWithSource(r, acct, model, endpoint, status, start, metrics, "grok")
+}
+
+func (g *Gateway) logFallback(r *http.Request, model, endpoint string, status int, start time.Time, metrics responseMetrics) {
+	g.logWithSource(r, nil, model, endpoint, status, start, metrics, "fallback")
+}
+
+func (g *Gateway) logWithSource(
+	r *http.Request,
+	acct *pool.Account,
+	model, endpoint string,
+	status int,
+	start time.Time,
+	metrics responseMetrics,
+	source string,
+) {
 	if status == 0 || g.store == nil {
 		return
 	}
@@ -783,6 +799,7 @@ func (g *Gateway) log(
 		TTFTMs:           metrics.TTFTMs,
 		LatencyMs:        totalLatencyMs,
 		Stream:           metrics.Stream,
+		Source:           source,
 	}
 	if err := g.store.InsertCallLog(ctx, l); err != nil {
 		log.Printf("写入调用记录失败: %v", err)

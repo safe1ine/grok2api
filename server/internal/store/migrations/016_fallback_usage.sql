@@ -1,0 +1,7 @@
+ALTER TABLE call_logs
+    ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'grok';
+
+CREATE TABLE IF NOT EXISTS fallback_usage_daily (
+    day   DATE PRIMARY KEY,
+    calls BIGINT NOT NULL DEFAULT 0
+);

@@ -111,6 +111,7 @@ type CallLog struct {
 	CreatedAt        time.Time `json:"created_at"`
 	KeyName          string    `json:"key_name"`
 	AccountEmail     string    `json:"account_email"`
+	Source           string    `json:"source"`
 }
 
 type Store struct {
@@ -637,40 +638,97 @@ func (s *Store) ListActiveKeyHashes(ctx context.Context) (map[string]int64, erro
 // ---------- 调用记录 ----------
 
 func (s *Store) InsertCallLog(ctx context.Context, l CallLog) error {
-	// 原始日志和分钟统计在同一条 SQL 中提交，任一写入失败都会整体回滚。
+	// 原始日志、分钟统计和 fallback 每日计数在同一条 SQL 中提交。
+	source := l.Source
+	if source == "" {
+		source = "grok"
+	}
 	_, err := s.pool.Exec(ctx, `
 		WITH inserted AS (
 			INSERT INTO call_logs (
 				key_id, account_id, model, endpoint, status, error_reason, prompt_tokens, cached_tokens,
-				completion_tokens, ttft_ms, latency_ms, stream
+				completion_tokens, ttft_ms, latency_ms, stream, source
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-			RETURNING created_at, key_id, model, prompt_tokens, cached_tokens, completion_tokens
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			RETURNING created_at, key_id, model, prompt_tokens, cached_tokens, completion_tokens, source
+		), minute AS (
+			INSERT INTO minute_usage_stats (
+				minute, key_id, model_name, calls,
+				input_tokens, cached_tokens, output_tokens,
+				long_context_input_tokens, long_context_cached_tokens, long_context_output_tokens
+			)
+			SELECT
+				date_trunc('minute', created_at), COALESCE(key_id, 0), COALESCE(model, ''), 1,
+				prompt_tokens, cached_tokens, completion_tokens,
+				CASE WHEN prompt_tokens > 200000 THEN prompt_tokens ELSE 0 END,
+				CASE WHEN prompt_tokens > 200000 THEN cached_tokens ELSE 0 END,
+				CASE WHEN prompt_tokens > 200000 THEN completion_tokens ELSE 0 END
+			FROM inserted
+			ON CONFLICT (minute, key_id, model_name) DO UPDATE SET
+				calls = minute_usage_stats.calls + EXCLUDED.calls,
+				input_tokens = minute_usage_stats.input_tokens + EXCLUDED.input_tokens,
+				cached_tokens = minute_usage_stats.cached_tokens + EXCLUDED.cached_tokens,
+				output_tokens = minute_usage_stats.output_tokens + EXCLUDED.output_tokens,
+				long_context_input_tokens = minute_usage_stats.long_context_input_tokens + EXCLUDED.long_context_input_tokens,
+				long_context_cached_tokens = minute_usage_stats.long_context_cached_tokens + EXCLUDED.long_context_cached_tokens,
+				long_context_output_tokens = minute_usage_stats.long_context_output_tokens + EXCLUDED.long_context_output_tokens,
+				updated_at = now()
+		), fallback_daily AS (
+			INSERT INTO fallback_usage_daily (day, calls)
+			SELECT (created_at AT TIME ZONE 'Asia/Shanghai')::date, 1
+			FROM inserted
+			WHERE source = 'fallback'
+			ON CONFLICT (day) DO UPDATE SET calls = fallback_usage_daily.calls + EXCLUDED.calls
 		)
-		INSERT INTO minute_usage_stats (
-			minute, key_id, model_name, calls,
-			input_tokens, cached_tokens, output_tokens,
-			long_context_input_tokens, long_context_cached_tokens, long_context_output_tokens
-		)
-		SELECT
-			date_trunc('minute', created_at), COALESCE(key_id, 0), COALESCE(model, ''), 1,
-			prompt_tokens, cached_tokens, completion_tokens,
-			CASE WHEN prompt_tokens > 200000 THEN prompt_tokens ELSE 0 END,
-			CASE WHEN prompt_tokens > 200000 THEN cached_tokens ELSE 0 END,
-			CASE WHEN prompt_tokens > 200000 THEN completion_tokens ELSE 0 END
-		FROM inserted
-		ON CONFLICT (minute, key_id, model_name) DO UPDATE SET
-			calls = minute_usage_stats.calls + EXCLUDED.calls,
-			input_tokens = minute_usage_stats.input_tokens + EXCLUDED.input_tokens,
-			cached_tokens = minute_usage_stats.cached_tokens + EXCLUDED.cached_tokens,
-			output_tokens = minute_usage_stats.output_tokens + EXCLUDED.output_tokens,
-			long_context_input_tokens = minute_usage_stats.long_context_input_tokens + EXCLUDED.long_context_input_tokens,
-			long_context_cached_tokens = minute_usage_stats.long_context_cached_tokens + EXCLUDED.long_context_cached_tokens,
-			long_context_output_tokens = minute_usage_stats.long_context_output_tokens + EXCLUDED.long_context_output_tokens,
-			updated_at = now()`,
+		SELECT 1`,
 		l.KeyID, l.AccountID, l.Model, l.Endpoint, l.Status, l.ErrorReason, l.PromptTokens, l.CachedTokens,
-		l.CompletionTokens, l.TTFTMs, l.LatencyMs, l.Stream)
+		l.CompletionTokens, l.TTFTMs, l.LatencyMs, l.Stream, source)
 	return err
+}
+
+type FallbackUsageDay struct {
+	Day   time.Time `json:"day"`
+	Calls int64     `json:"calls"`
+}
+
+type FallbackUsage struct {
+	HistoricalCalls int64
+	TodayCalls      int64
+	Daily           []FallbackUsageDay
+}
+
+func (s *Store) FallbackUsage(ctx context.Context, days int) (FallbackUsage, error) {
+	if days < 1 {
+		days = 30
+	}
+	var usage FallbackUsage
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(calls), 0),
+		       COALESCE(SUM(calls) FILTER (WHERE day = (now() AT TIME ZONE 'Asia/Shanghai')::date), 0)
+		FROM fallback_usage_daily`).Scan(&usage.HistoricalCalls, &usage.TodayCalls); err != nil {
+		return FallbackUsage{}, err
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT series.day::date, COALESCE(usage.calls, 0)
+		FROM generate_series(
+			(now() AT TIME ZONE 'Asia/Shanghai')::date - $1::int + 1,
+			(now() AT TIME ZONE 'Asia/Shanghai')::date,
+			interval '1 day'
+		) AS series(day)
+		LEFT JOIN fallback_usage_daily usage ON usage.day = series.day::date
+		ORDER BY series.day`, days)
+	if err != nil {
+		return FallbackUsage{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var point FallbackUsageDay
+		if err := rows.Scan(&point.Day, &point.Calls); err != nil {
+			return FallbackUsage{}, err
+		}
+		usage.Daily = append(usage.Daily, point)
+	}
+	return usage, rows.Err()
 }
 
 func (s *Store) ListMinuteUsage(
