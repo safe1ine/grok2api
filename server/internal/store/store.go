@@ -34,6 +34,18 @@ type AccountRecord struct {
 	GroupID            int64      `json:"group_id"`
 }
 
+type FallbackConfig struct {
+	OpenAIBaseURL    string    `json:"openai_base_url"`
+	OpenAIModel      string    `json:"openai_model"`
+	OpenAIKey        string    `json:"-"`
+	OpenAIKeySet     bool      `json:"openai_key_set"`
+	AnthropicBaseURL string    `json:"anthropic_base_url"`
+	AnthropicModel   string    `json:"anthropic_model"`
+	AnthropicKey     string    `json:"-"`
+	AnthropicKeySet  bool      `json:"anthropic_key_set"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
 type AccountGroup struct {
 	ID        int64     `json:"id"`
 	Name      string    `json:"name"`
@@ -400,6 +412,58 @@ func (s *Store) DeleteAccount(ctx context.Context, id int64) error {
 
 func (s *Store) TouchLastUsed(ctx context.Context, id int64) {
 	_, _ = s.pool.Exec(ctx, `UPDATE accounts SET last_used_at = now() WHERE id = $1`, id)
+}
+
+func (s *Store) GetFallbackConfig(ctx context.Context) (FallbackConfig, error) {
+	var config FallbackConfig
+	var openAIKey, anthropicKey []byte
+	err := s.pool.QueryRow(ctx, `
+		SELECT openai_base_url, openai_model, openai_key_enc,
+		       anthropic_base_url, anthropic_model, anthropic_key_enc, updated_at
+		FROM fallback_config WHERE id = 1`).Scan(
+		&config.OpenAIBaseURL, &config.OpenAIModel, &openAIKey,
+		&config.AnthropicBaseURL, &config.AnthropicModel, &anthropicKey, &config.UpdatedAt)
+	if err != nil {
+		return FallbackConfig{}, err
+	}
+	if len(openAIKey) > 0 {
+		plain, err := s.enc.Decrypt(openAIKey)
+		if err != nil {
+			return FallbackConfig{}, fmt.Errorf("解密 OpenAI fallback key 失败: %w", err)
+		}
+		config.OpenAIKey, config.OpenAIKeySet = string(plain), true
+	}
+	if len(anthropicKey) > 0 {
+		plain, err := s.enc.Decrypt(anthropicKey)
+		if err != nil {
+			return FallbackConfig{}, fmt.Errorf("解密 Anthropic fallback key 失败: %w", err)
+		}
+		config.AnthropicKey, config.AnthropicKeySet = string(plain), true
+	}
+	return config, nil
+}
+
+func (s *Store) SaveFallbackConfig(ctx context.Context, config FallbackConfig) error {
+	var openAIKey, anthropicKey []byte
+	var err error
+	if config.OpenAIKey != "" {
+		openAIKey, err = s.enc.Encrypt([]byte(config.OpenAIKey))
+		if err != nil {
+			return err
+		}
+	}
+	if config.AnthropicKey != "" {
+		anthropicKey, err = s.enc.Encrypt([]byte(config.AnthropicKey))
+		if err != nil {
+			return err
+		}
+	}
+	_, err = s.pool.Exec(ctx, `
+		UPDATE fallback_config SET openai_base_url = $1, openai_model = $2, openai_key_enc = $3,
+		    anthropic_base_url = $4, anthropic_model = $5, anthropic_key_enc = $6, updated_at = now()
+		WHERE id = 1`, config.OpenAIBaseURL, config.OpenAIModel, openAIKey,
+		config.AnthropicBaseURL, config.AnthropicModel, anthropicKey)
+	return err
 }
 
 // ---------- 视频任务 ----------

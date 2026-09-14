@@ -1,4 +1,4 @@
-import { GaugeIcon, KeyRoundIcon, ScrollTextIcon, SparklesIcon, UsersRoundIcon } from 'lucide-react'
+import { GaugeIcon, KeyRoundIcon, ScrollTextIcon, Settings2Icon, SparklesIcon, UsersRoundIcon } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
 
 const navItems = [
@@ -6,6 +6,7 @@ const navItems = [
   { to: '/accounts', label: '账号管理', icon: UsersRoundIcon },
   { to: '/keys', label: '密钥管理', icon: KeyRoundIcon },
   { to: '/logs', label: '调用记录', icon: ScrollTextIcon },
+  { to: '/config', label: '其他配置', icon: Settings2Icon },
 ]
 
 export default function Layout() {

@@ -5,6 +5,7 @@ import Login from './pages/Login'
 import Accounts from './pages/Accounts'
 import Keys from './pages/Keys'
 import Logs from './pages/Logs'
+import Config from './pages/Config'
 import { isAuthed } from './api'
 
 const Dashboard = lazy(() => import('./pages/Dashboard'))
@@ -39,6 +40,7 @@ export default function App() {
         <Route path="accounts" element={<Accounts />} />
         <Route path="keys" element={<Keys />} />
         <Route path="logs" element={<Logs />} />
+        <Route path="config" element={<Config />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

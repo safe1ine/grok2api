@@ -194,8 +194,21 @@ func (g *Gateway) videoJobAccount(ctx context.Context, jobID string) (int64, boo
 }
 
 func (g *Gateway) Proxy(w http.ResponseWriter, r *http.Request) {
+	g.proxy(w, r, "")
+}
+
+func (g *Gateway) ProxyOpenAI(w http.ResponseWriter, r *http.Request) {
+	g.proxy(w, r, "openai")
+}
+
+func (g *Gateway) ProxyAnthropic(w http.ResponseWriter, r *http.Request) {
+	g.proxy(w, r, "anthropic")
+}
+
+func (g *Gateway) proxy(w http.ResponseWriter, r *http.Request, provider string) {
 	start := time.Now()
 	body, _ := io.ReadAll(r.Body)
+	originalBody := append([]byte(nil), body...)
 	if r.URL.Path == "/v1/chat/completions" {
 		body, _ = ensureChatStreamUsage(body)
 	}
@@ -410,6 +423,11 @@ accountsLoop:
 		}
 	}
 
+	if finalStatus == 0 && provider != "" {
+		if g.proxyFallback(w, r, provider, originalBody, start, metrics) {
+			return
+		}
+	}
 	if finalStatus == 0 {
 		finalStatus = http.StatusServiceUnavailable
 		if lastFailureReason == "" {
@@ -560,6 +578,9 @@ func (g *Gateway) HandleTTS(w http.ResponseWriter, r *http.Request) {
 
 	resp, acct, err := g.simpleUpstream(r, http.MethodPost, "/v1/tts", payloadBytes)
 	if err != nil {
+		if g.proxyFallback(w, r, "openai", body, start, responseMetrics{}) {
+			return
+		}
 		g.writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -604,6 +625,9 @@ func (g *Gateway) HandleSTT(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	resp, acct, err := g.simpleUpstream(r, http.MethodPost, "/v1/stt", body)
 	if err != nil {
+		if g.proxyFallback(w, r, "openai", body, start, responseMetrics{}) {
+			return
+		}
 		g.writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}

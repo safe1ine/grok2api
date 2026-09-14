@@ -373,6 +373,66 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
+func (h *Handler) GetFallbackConfig(w http.ResponseWriter, r *http.Request) {
+	config, err := h.store.GetFallbackConfig(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, config)
+}
+
+func validFallbackBaseURL(raw string) bool {
+	if raw == "" {
+		return true
+	}
+	u, err := url.Parse(raw)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" && u.User == nil && u.RawQuery == "" && u.Fragment == ""
+}
+
+func (h *Handler) UpdateFallbackConfig(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		OpenAIBaseURL    string  `json:"openai_base_url"`
+		OpenAIModel      string  `json:"openai_model"`
+		OpenAIKey        *string `json:"openai_key"`
+		AnthropicBaseURL string  `json:"anthropic_base_url"`
+		AnthropicModel   string  `json:"anthropic_model"`
+		AnthropicKey     *string `json:"anthropic_key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体格式错误")
+		return
+	}
+	in.OpenAIBaseURL, in.AnthropicBaseURL = strings.TrimRight(strings.TrimSpace(in.OpenAIBaseURL), "/"), strings.TrimRight(strings.TrimSpace(in.AnthropicBaseURL), "/")
+	in.OpenAIModel, in.AnthropicModel = strings.TrimSpace(in.OpenAIModel), strings.TrimSpace(in.AnthropicModel)
+	if !validFallbackBaseURL(in.OpenAIBaseURL) || !validFallbackBaseURL(in.AnthropicBaseURL) {
+		writeErr(w, http.StatusBadRequest, "fallback Base URL 必须是合法的 HTTP 或 HTTPS 地址")
+		return
+	}
+	current, err := h.store.GetFallbackConfig(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	config := store.FallbackConfig{OpenAIBaseURL: in.OpenAIBaseURL, OpenAIModel: in.OpenAIModel, OpenAIKey: current.OpenAIKey, AnthropicBaseURL: in.AnthropicBaseURL, AnthropicModel: in.AnthropicModel, AnthropicKey: current.AnthropicKey}
+	if in.OpenAIKey != nil {
+		config.OpenAIKey = strings.TrimSpace(*in.OpenAIKey)
+	}
+	if in.AnthropicKey != nil {
+		config.AnthropicKey = strings.TrimSpace(*in.AnthropicKey)
+	}
+	if err := h.store.SaveFallbackConfig(r.Context(), config); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	updated, err := h.store.GetFallbackConfig(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
 func (h *Handler) ListAccountGroups(w http.ResponseWriter, r *http.Request) {
 	groups, err := h.store.ListAccountGroups(r.Context())
 	if err != nil {

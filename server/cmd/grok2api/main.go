@@ -149,12 +149,12 @@ func main() {
 	openaiV1.Get("/v1/models", gw.HandleModels)
 	openaiV1.Post("/v1/audio/speech", gw.HandleTTS)
 	openaiV1.Post("/v1/audio/transcriptions", gw.HandleSTT)
-	openaiV1.HandleFunc("/*", gw.Proxy)
+	openaiV1.HandleFunc("/*", gw.ProxyOpenAI)
 
 	// Anthropic 前缀：/api/open/anthropic/v1/*
 	anthropicV1 := chi.NewRouter()
 	anthropicV1.Get("/v1/models", gw.HandleModels)
-	anthropicV1.HandleFunc("/*", gw.Proxy)
+	anthropicV1.HandleFunc("/*", gw.ProxyAnthropic)
 
 	r := chi.NewRouter()
 	r.Use(corsMiddleware)
@@ -178,6 +178,8 @@ func main() {
 			g.Post("/oauth/device", h.DeviceStart)
 			g.Get("/oauth/device/status", h.DeviceStatus)
 			g.Get("/accounts", h.ListAccounts)
+			g.Get("/config/fallback", h.GetFallbackConfig)
+			g.Put("/config/fallback", h.UpdateFallbackConfig)
 			g.Get("/account-groups", h.ListAccountGroups)
 			g.Post("/account-groups", h.CreateAccountGroup)
 			g.Put("/account-groups/{id}", h.RenameAccountGroup)
