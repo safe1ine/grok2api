@@ -1,9 +1,11 @@
 package gateway
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -22,6 +24,72 @@ type responseMetrics struct {
 
 	firstBodyMs int
 	ttftSet     bool
+}
+
+func streamCopyRawWithMetrics(w http.ResponseWriter, body io.Reader, contentType string, start time.Time) (metrics responseMetrics) {
+	flusher, canFlush := w.(http.Flusher)
+	if isEventStream(contentType) {
+		metrics.Stream = true
+		reader := bufio.NewReaderSize(body, 32*1024)
+		for {
+			line, err := reader.ReadString('\n')
+			if line != "" {
+				metrics.markFirstBody(start)
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "data:") {
+					data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+					if data == "[DONE]" {
+						metrics.StreamCompleted = true
+					} else if data != "" {
+						observeResponsePayload([]byte(data), &metrics, start)
+					}
+				}
+				if _, writeErr := io.WriteString(w, line); writeErr != nil {
+					metrics.DownstreamDisconnected = true
+					break
+				}
+				if canFlush {
+					flusher.Flush()
+				}
+			}
+			if err != nil {
+				if err != io.EOF {
+					metrics.UpstreamReadError = true
+				}
+				break
+			}
+		}
+		metrics.finalizeTTFT()
+		return metrics
+	}
+
+	var captured bytes.Buffer
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := body.Read(buf)
+		if n > 0 {
+			metrics.markFirstBody(start)
+			if captured.Len() < 2<<20 {
+				remaining := (2 << 20) - captured.Len()
+				_, _ = captured.Write(buf[:min(n, remaining)])
+			}
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				metrics.DownstreamDisconnected = true
+				break
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				metrics.UpstreamReadError = true
+			}
+			break
+		}
+	}
+	if strings.Contains(strings.ToLower(contentType), "json") {
+		observeResponsePayload(captured.Bytes(), &metrics, start)
+	}
+	metrics.finalizeTTFT()
+	return metrics
 }
 
 func parseStreamRequest(body []byte) bool {

@@ -124,7 +124,11 @@ func (g *Gateway) proxyFallback(w http.ResponseWriter, r *http.Request, provider
 	if r.URL.RawQuery != "" {
 		path += "?" + r.URL.RawQuery
 	}
-	request, err := http.NewRequestWithContext(r.Context(), r.Method, fallbackTarget(baseURL, path), bytes.NewReader(replaceFallbackModel(body, model)))
+	fallbackBody := replaceFallbackModel(body, model)
+	if provider == "openai" && r.URL.Path == "/v1/chat/completions" {
+		fallbackBody, _ = ensureChatStreamUsage(fallbackBody)
+	}
+	request, err := http.NewRequestWithContext(r.Context(), r.Method, fallbackTarget(baseURL, path), bytes.NewReader(fallbackBody))
 	if err != nil {
 		return false
 	}
@@ -147,8 +151,8 @@ func (g *Gateway) proxyFallback(w http.ResponseWriter, r *http.Request, provider
 	defer response.Body.Close()
 	copyHeaders(w.Header(), response.Header, excludeRespHeaders)
 	w.WriteHeader(response.StatusCode)
-	g.streamCopy(w, response.Body)
-	metrics := responseMetrics{Stream: requestMetrics.Stream}
+	metrics := streamCopyRawWithMetrics(w, response.Body, response.Header.Get("Content-Type"), start)
+	metrics.Stream = requestMetrics.Stream
 	if response.StatusCode >= 400 {
 		metrics.ErrorReason = "fallback 上游错误"
 	}
